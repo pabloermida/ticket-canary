@@ -43,6 +43,7 @@ def main():
                 seen_tickets.add(ticket["id"])
 
         time.sleep(CHECK_INTERVAL)
+        print("Finished, trying again...")
 
 
 if __name__ == "__main__":
