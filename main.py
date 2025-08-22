@@ -17,34 +17,47 @@ def fetch_tickets() -> List[Dict]:
     """
     Fetch recent tickets from Agidesk's API
     """
-    return []
 
+    headers = {
+        "Authorization": f"Bearer {AGIDESK_API_KEY}",
+        "Accept": "application/json"
+    }
+    response = requests.get(AGIDESK_API_URL, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
 def notify_teams(ticket: Dict):
     """
     Sends a notification to Microsoft Teams about a new ticket.
     """
-    print(f"New ticket #{ticket['id']}")
+
+    message = {
+        "text": f"New ticket: {ticket['id']} - {ticket['title']}"
+    }
+    response = requests.post(TEAMS_WEBHOOK_URL, json=message)
+    if response.status_code == 200:
+        print(f"Ticket #{ticket['id']} send to Teams")
+    else:
+        print(f"Error sending to Teams: {response.status_code}, {response.text}")
 
 def main():
     if not AGIDESK_API_KEY or not TEAMS_WEBHOOK_URL:
-        print("Error: Missing required environment variables.")
-        print("Please set AGIDESK_API_KEY and TEAMS_WEBHOOK_URL.")
+        print("ERROR: Missing variables!")
+        print("Please, set AGIDESK_API_KEY and TEAMS_WEBHOOK_URL")
         return
 
-    print("Starting Agidesk → Teams notifier...")
+    print("Starting Agidesk -> Teams notifier...")
     seen_tickets = set()
 
     while True:
         tickets = fetch_tickets()
         for ticket in tickets:
-            if ticket["id"] not in seen_tickets and ticket["owner"] is None:
+            if ticket["id"] not in seen_tickets and ticket.get("team_id") is None:
                 notify_teams(ticket)
                 seen_tickets.add(ticket["id"])
 
         time.sleep(CHECK_INTERVAL)
         print("Finished, trying again...")
-
 
 if __name__ == "__main__":
     main()
