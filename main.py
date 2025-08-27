@@ -1,5 +1,7 @@
 import time
 import os
+import logging
+from typing import List, Dict
 from typing import List
 from dotenv import load_dotenv
 from agidesk import AgideskAPI, Ticket
@@ -15,6 +17,11 @@ TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 FETCH_TIME_MINUTES = int(os.getenv("FETCH_TIME_MINUTES", "50"))
 ID_TIME_SERVICOS = 1
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 def fetch_tickets(api: AgideskAPI, initial_date: str) -> List[Ticket]:
     """
@@ -40,17 +47,20 @@ def fetch_tickets(api: AgideskAPI, initial_date: str) -> List[Ticket]:
 
 def notify_teams(ticket: Ticket):
     """
-    Sends a notification to Microsoft Teams about a new ticket.
+    Envia notificação para o Microsoft Teams sobre um novo ticket.
     """
-    msg = f"**Novo Ticket:** #{ticket.id}: {ticket.title}"
-    if ticket.priority and "alta" in ticket.priority.lower():
-        msg += " 🚨 **Prioridade Alta**"
+    message = {
+        "text": f"Novo ticket:\n- ID: {ticket.id}\n- Título: {ticket.title}"
+    }
 
-    print(f"Notifying Teams for ticket #{ticket.id}")
     try:
-        print(f"Notification sent for ticket #{ticket.id}")
-    except requests.exceptions.RequestException as e:
-        print(f"Error sending Teams notification for ticket #{ticket.id}: {e}")
+        response = requests.post(TEAMS_WEBHOOK_URL, json=message, timeout=10)
+        if response.status_code == 200:
+            logging.info(f"Ticket #{ticket.id} enviado ao Teams")
+        else:
+            logging.error(f"Erro ao enviar para Teams: {response.status_code} - {response.text}")
+    except requests.RequestException as e:
+        logging.error(f"Erro de conexão com Teams: {e}")
 
 
 def main():
