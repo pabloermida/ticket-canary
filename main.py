@@ -3,18 +3,6 @@
 
 """
 Router de Polling (Agidesk -> OpenAI Responses API -> Teams -> Agidesk)
-
-Pontos principais:
-- OpenAI: usa /v1/responses com input no formato de mensagens (content.type="input_text")
-  e Structured Outputs via text.format + json_schema (strict=True).
-- Mock: lê mock_ticket.json (lista ou objeto). Dá para usar OpenAI real no mock
-  (defina OPENAI_STUB_IN_MOCK=0 e OPENAI_API_KEY).
-- Agidesk: usa apenas os endpoints/campos confirmados por você:
-    GET  /api/v1/issues?per_page=1000&page=1&periodfield=created_at&initialdate=...&finaldate=...
-    GET  /api/v1/issues/{id}
-    PUT  /api/v1/issues/{id} -> payload {"service":{"actiondescription":"...", "tag":"router:processed"}}
-- Filtros em memória: team_id == "1", type in {"Incidente","Requisição"}, sem tag router:processed,
-  e (no modo real) created_at nos últimos 5 minutos.
 """
 
 import os
@@ -22,34 +10,40 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
-
 import requests
+import logging
 
-# (opcional) carregar .env se existir, sem quebrar caso lib não esteja instalada
 try:
-    from dotenv import load_dotenv  # type: ignore
+    from dotenv import load_dotenv
     load_dotenv()
-except Exception:
+except ImportError:
     pass
+
+from agidesk import AgideskAPI, Ticket
 
 # ============ VARS / CONFIG ============
 
-AGIDESK_BASE_URL = os.getenv("AGIDESK_BASE_URL", "").rstrip("/")  # ex: https://infiniit.agidesk.com
-AGIDESK_API_TOKEN = os.getenv("AGIDESK_API_TOKEN", "")
+AGIDESK_ACCOUNT_ID = os.getenv("AGIDESK_ACCOUNT_ID", "")
+AGIDESK_APP_KEY = os.getenv("AGIDESK_APP_KEY", "")
 
-TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")  # Incoming Webhook do Teams
+TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # modelos compatíveis com Responses API
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 ROUTER_PROCESSED_TAG = os.getenv("ROUTER_PROCESSED_TAG", "router:processed")
 
-POLL_INTERVAL_SEC = 300
+POLL_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL", "300"))
+FETCH_TIME_MINUTES = int(os.getenv("FETCH_TIME_MINUTES", "5"))
 
 MOCK_MODE = os.getenv("MOCK", "0") == "1"
-# por padrão, em mock NÃO chamamos HTTP da OpenAI; ajuste para 0 se quiser usar OpenAI real no mock
 OPENAI_STUB_IN_MOCK = os.getenv("OPENAI_STUB_IN_MOCK", "1") == "1"
+ID_TIME_SERVICOS = "1"
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 # ============ TEMPO/FORMATOS ============
 
@@ -82,89 +76,9 @@ def within_last_minutes(created_at: str, minutes: int = 5) -> bool:
     return bool(dt) and (now_utc() - dt) <= timedelta(minutes=minutes)
 
 
-# ============ HTTP helpers (uso no modo real) ============
-
-def http_get_json(url: str, headers: Dict[str, str], params: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.get(url, headers=headers, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def http_put_json(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.put(url, headers=headers, json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json() if r.text.strip() else {}
-
-
-# ============ Agidesk Client (somente rotas e params confirmados) ============
-
-class AgideskClient:
-    """
-    GET  /api/v1/issues
-         params: per_page, page, periodfield, initialdate, finaldate
-    GET  /api/v1/issues/{id}
-    PUT  /api/v1/issues/{id}  (payload: {"service":{"actiondescription": "...", "tag": ROUTER_PROCESSED_TAG}})
-    """
-    def __init__(self, base_url: str, token: str):
-        self.base_url = base_url.rstrip("/")
-        self.token = token
-
-    def _headers(self) -> Dict[str, str]:
-        return {"Content-Type": "application/json"}
-
-    def list_recent_issues(self) -> List[Dict[str, Any]]:
-        end = now_utc()
-        start = end - timedelta(minutes=5)
-        params = {
-            "app_key": self.token,
-            "per_page": "1000",
-            "page": "1",
-            "periodfield": "created_at",
-            "initialdate": ds_time(start),
-            "finaldate": ds_time(end),
-            "forecast": "teams",
-            "team_id": [1]
-        }
-        url = f"{self.base_url}/api/v1/issues"
-        data = http_get_json(url, headers=self._headers(), params=params)
-
-        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-            items = [x for x in data["data"] if isinstance(x, dict)]
-            return items
-
-        # 2) Se vier dict sem "data", mas já for uma lista embutida em outra chave conhecida
-        if isinstance(data, dict):
-            # tenta achar a primeira lista de dicts dentro
-            for v in data.values():
-                if isinstance(v, list) and all(isinstance(it, dict) for it in v):
-                    return v
-            # se não achou, e se o dict em si já parece um "item", embrulha em lista
-            return [data] if data else []
-
-        # 3) Se vier lista pura
-        if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
-
-        # 4) Qualquer outro formato: retorna vazio
-        return []
-
-    def get_issue(self, issue_id: str) -> Dict[str, Any]:
-        url = f"{self.base_url}/api/v1/issues/{issue_id}"
-        return http_get_json(url, headers=self._headers(), params={})
-
-    def update_issue(self, issue_id: str, update_payload: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{self.base_url}/api/v1/issues/{issue_id}"
-        return http_put_json(url, headers=self._headers(), payload=update_payload)
-
-
-# ============ Mock Agidesk (aceita lista) ============
+# ============ Mock Agidesk ============
 
 def load_mock_issues_from_file() -> List[Dict[str, Any]]:
-    """
-    Lê mock_ticket.json na mesma pasta:
-    - se for lista: retorna lista filtrando apenas dicts
-    - se for dict: embrulha em lista
-    """
     path = os.path.join(os.path.dirname(__file__), "mock_ticket.json")
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -175,30 +89,27 @@ def load_mock_issues_from_file() -> List[Dict[str, Any]]:
     raise RuntimeError("mock_ticket.json deve ser objeto ou lista de objetos")
 
 
-class MockAgideskClient(AgideskClient):
-    def __init__(self, base_url: str, token: str, mock_issues: List[Dict[str, Any]]):
-        super().__init__(base_url, token)
+class MockAgideskClient:
+    def __init__(self, mock_issues: List[Dict[str, Any]]):
         if not mock_issues:
             raise RuntimeError("Mock vazio.")
-        self._issues = mock_issues
+        self._issues = [Ticket.model_validate(issue) for issue in mock_issues]
 
-    def list_recent_issues(self) -> List[Dict[str, Any]]:
+    def search_tickets(self, **kwargs) -> List[Ticket]:
         return self._issues
 
-    def get_issue(self, issue_id: str) -> Dict[str, Any]:
+    def get_issue(self, issue_id: str) -> Optional[Ticket]:
         for it in self._issues:
-            if str(it.get("id")) == str(issue_id):
+            if str(it.id) == str(issue_id):
                 return it
-        return self._issues[0]
+        return self._issues[0] if self._issues else None
 
     def update_issue(self, issue_id: str, update_payload: Dict[str, Any]) -> Dict[str, Any]:
         for it in self._issues:
-            if str(it.get("id")) == str(issue_id):
-                it.setdefault("service_update", {}).update(update_payload.get("service", {}))
-                return {"ok": True, "service": it["service_update"]}
-        self._issues[0].setdefault("service_update", {}).update(update_payload.get("service", {}))
-        return {"ok": True, "service": self._issues[0]["service_update"]}
-
+            if str(it.id) == str(issue_id):
+                # Mock update logic is complex, returning simple success
+                return {"ok": True, "service": update_payload.get("service", {})}
+        return {"ok": True, "service": update_payload.get("service", {})}
 
 # ============ OpenAI (Responses API com Structured Outputs) ============
 
@@ -306,9 +217,7 @@ def openai_ticket_schema_block() -> dict:
     }
 
 
-
-
-def build_responses_input_from_issue(issue: dict) -> List[Dict[str, Any]]:
+def build_responses_input_from_issue(issue: Ticket) -> List[Dict[str, Any]]:
     """
     Monta 'input' no formato recomendado pelo Responses API:
     lista de mensagens, cada uma com 'content' = [{ "type": "input_text", "text": "..." }]
@@ -318,9 +227,9 @@ def build_responses_input_from_issue(issue: dict) -> List[Dict[str, Any]]:
         "Retorne APENAS JSON aderente ao schema (strict)."
     )
     # Sanitiza: remove HTML gigante e limita tamanho do payload
-    issue_copy = dict(issue)
-    issue_copy.pop("htmlcontent", None)
-    raw_issue = json.dumps(issue_copy, ensure_ascii=False)
+    issue_dict = issue.model_dump(exclude_none=True)
+    issue_dict.pop("htmlcontent", None)
+    raw_issue = json.dumps(issue_dict, ensure_ascii=False)
     if len(raw_issue) > 120000:
         raw_issue = raw_issue[:120000] + "\n... [TRUNCADO PELO ROUTER]"
 
@@ -330,7 +239,7 @@ def build_responses_input_from_issue(issue: dict) -> List[Dict[str, Any]]:
     ]
 
 
-def call_openai_structured(issue: Dict[str, Any]) -> Dict[str, Any]:
+def call_openai_structured(issue: Ticket) -> Dict[str, Any]:
     """
     Chama /v1/responses com:
       - input: mensagens (input_text)
@@ -339,8 +248,8 @@ def call_openai_structured(issue: Dict[str, Any]) -> Dict[str, Any]:
     """
     if MOCK_MODE and (OPENAI_STUB_IN_MOCK or not OPENAI_API_KEY):
         # Stub para testes offline (sem HTTP)
-        ticket_id = str(issue.get("id", "mock"))
-        title = issue.get("title", "(sem título)")
+        ticket_id = str(issue.id)
+        title = issue.title
         return {
             "version": "stub-1",
             "ticket_id": ticket_id,
@@ -467,16 +376,17 @@ def post_to_teams(markdown_text: str) -> tuple[bool, str]:
 
 # ============ Renderizações (blog + formulário) ============
 
-def render_blog(ai: Dict[str, Any], issue: Dict[str, Any]) -> str:
+def render_blog(ai: Dict[str, Any], issue: Ticket) -> str:
     md: List[str] = []
     md.append(f"### Ticket {ai.get('ticket_id','?')} — Análise Técnica")
     md.append(f"**Resumo:** {ai.get('summary_for_teams','')}")
     md.append("")
     md.append("#### Contexto")
-    md.append(f"- Título: {issue.get('title')}")
-    md.append(f"- Criado em: {issue.get('created_at')}")
-    if issue.get("source"):
-        md.append(f"- Origem: {issue.get('source')}")
+    md.append(f"- Título: {issue.title}")
+    md.append(f"- Criado em: {issue.created_at}")
+    issue_dict = issue.model_dump()
+    if issue_dict.get("source"):
+        md.append(f"- Origem: {issue_dict.get('source')}")
     md.append("")
     prob = ai.get("problem", {}) or {}
     md.append("#### Explicação")
@@ -541,33 +451,30 @@ def build_agidesk_update_payload(ai: Dict[str, Any], blog_md: str, form_md: str)
 
 # ============ Filtros ============
 
-def pass_filters(issue: Dict[str, Any]) -> bool:
-    if not isinstance(issue, dict):
-        return False
+def pass_filters(issue: Ticket) -> bool:
     # no modo real, exigimos janela de 5 min; no mock, liberamos para facilitar testes
-    if not MOCK_MODE and not within_last_minutes(issue.get("created_at", ""), 5):
+    if not MOCK_MODE and not within_last_minutes(issue.created_at or "", FETCH_TIME_MINUTES):
         return False
-    if str(issue.get("team_id")) != "1":
+    if str(issue.team_id) != ID_TIME_SERVICOS:
         return False
-    if (issue.get("type") or "").strip() not in {"Incidente", "Requisição"}:
+    if (issue.type or "").strip() not in {"Incidente", "Requisição"}:
         return False
-    tag_txt = issue.get("tag")
-    if isinstance(tag_txt, str) and tag_txt.strip().lower() == ROUTER_PROCESSED_TAG.lower():
-        return False
+    # A verificação de tag precisa de um campo 'tag' no modelo Ticket
+    # if isinstance(issue.tag, str) and issue.tag.strip().lower() == ROUTER_PROCESSED_TAG.lower():
+    #     return False
     return True
 
 
 # ============ Pipeline de 1 ticket ============
 
-def process_issue(agi_client, issue: Dict[str, Any]) -> Dict[str, Any]:
-    issue_id = str(issue.get("id", "mock"))
+def process_issue(agi_client, issue: Ticket) -> Dict[str, Any]:
+    issue_id = str(issue.id)
     try:
-        full = agi_client.get_issue(issue_id)
+        full_issue = agi_client.get_issue(issue_id)
     except Exception:
-        full = {}
+        full_issue = None
 
-    issue_for_ai = issue.copy()
-    issue_for_ai["details"] = full
+    issue_for_ai = full_issue if full_issue else issue
 
     ai = call_openai_structured(issue_for_ai)
     blog_md = render_blog(ai, issue)
@@ -598,19 +505,25 @@ def process_issue(agi_client, issue: Dict[str, Any]) -> Dict[str, Any]:
 # ============ MAIN ============
 
 def main() -> None:
-    print("MOCK_MODE =", MOCK_MODE)
+    required_vars = ["AGIDESK_ACCOUNT_ID", "AGIDESK_APP_KEY", "TEAMS_WEBHOOK_URL"]
+    if not MOCK_MODE:
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if missing_vars:
+            logging.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+            return
+
+    logging.info(f"--- Starting Ticket Canary (MOCK_MODE={MOCK_MODE}) ---")
 
     if MOCK_MODE:
         try:
             mock_issues = load_mock_issues_from_file()
         except Exception as e:
             raise SystemExit(f"[ERRO] Falha lendo mock_ticket.json: {e}")
-        agi = MockAgideskClient(AGIDESK_BASE_URL, AGIDESK_API_TOKEN, mock_issues)
-        issues = agi.list_recent_issues()
-
-        selected = [i for i in issues if isinstance(i, dict) and pass_filters(i)]
+        agi = MockAgideskClient(mock_issues)
+        issues = agi.search_tickets()
+        selected = [i for i in issues if pass_filters(i)]
         if not selected and issues:
-            selected = [issues[0]]  # processa ao menos 1 no mock
+            selected = [issues[0]]
 
         for i in selected:
             result = process_issue(agi, i)
@@ -618,16 +531,28 @@ def main() -> None:
         return
 
     # modo real: polling
-    agi = AgideskClient(AGIDESK_BASE_URL, AGIDESK_API_TOKEN)
+    agi = AgideskAPI(account_id=AGIDESK_ACCOUNT_ID, app_key=AGIDESK_APP_KEY)
     while True:
         try:
-            issues = agi.list_recent_issues()
-            selected = [i for i in issues if isinstance(i, dict) and pass_filters(i)]
+            start_time = now_utc()
+            initial_date = start_time - timedelta(minutes=FETCH_TIME_MINUTES)
+            initial_date_str = ds_time(initial_date)
+
+            issues = agi.search_tickets(
+                periodfield='created_at',
+                initialdate=initial_date_str,
+                team=[ID_TIME_SERVICOS]
+            )
+            logging.info(f"Found {len(issues)} tickets.")
+
+            selected = [i for i in issues if pass_filters(i)]
             for i in selected:
                 result = process_issue(agi, i)
                 print(json.dumps(result, ensure_ascii=False, indent=2))
         except Exception as e:
-            print("[ERROR]", e)
+            logging.error(f"An error occurred: {e}")
+        
+        logging.info(f"Finished check. Waiting for {POLL_INTERVAL_SEC} seconds...")
         time.sleep(POLL_INTERVAL_SEC)
 
 
