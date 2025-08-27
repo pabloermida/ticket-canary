@@ -14,7 +14,7 @@ AGIDESK_APP_KEY = os.getenv("AGIDESK_APP_KEY")
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 FETCH_TIME_MINUTES = int(os.getenv("FETCH_TIME_MINUTES", "50"))
-
+ID_TIME_SERVICOS = 1
 
 def fetch_tickets(api: AgideskAPI, initial_date: str) -> List[Ticket]:
     """
@@ -26,6 +26,7 @@ def fetch_tickets(api: AgideskAPI, initial_date: str) -> List[Ticket]:
         periodfield='created_at',
         initialdate=initial_date,
         per_page=100,
+        team=[ID_TIME_SERVICOS],
         fields='id,title,content,contact,contacts,responsible_id,priority,type,team_id'
     )
 
