@@ -34,7 +34,7 @@ except Exception:
 
 # ============ VARS / CONFIG ============
 
-AGIDESK_BASE_URL = os.getenv("AGIDESK_BASE_URL", "").rstrip("/")  # ex: https://SEU_TENANT.agidesk.com
+AGIDESK_BASE_URL = os.getenv("AGIDESK_BASE_URL", "").rstrip("/")  # ex: https://infiniit.agidesk.com
 AGIDESK_API_TOKEN = os.getenv("AGIDESK_API_TOKEN", "")
 
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")  # Incoming Webhook do Teams
@@ -110,12 +110,13 @@ class AgideskClient:
         self.token = token
 
     def _headers(self) -> Dict[str, str]:
-        return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        return {"Content-Type": "application/json"}
 
     def list_recent_issues(self) -> List[Dict[str, Any]]:
         end = now_utc()
         start = end - timedelta(minutes=5)
         params = {
+            "app_key": self.token,
             "per_page": "1000",
             "page": "1",
             "periodfield": "created_at",
@@ -127,13 +128,25 @@ class AgideskClient:
         url = f"{self.base_url}/api/v1/issues"
         data = http_get_json(url, headers=self._headers(), params=params)
 
-        raw = data.get("data", data)
-        if isinstance(raw, dict) and "data" in raw:
-            raw = raw["data"]
-        if isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], list):
-            raw = raw[0]
-        items = [x for x in raw if isinstance(x, dict)]
-        return items
+        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+            items = [x for x in data["data"] if isinstance(x, dict)]
+            return items
+
+        # 2) Se vier dict sem "data", mas já for uma lista embutida em outra chave conhecida
+        if isinstance(data, dict):
+            # tenta achar a primeira lista de dicts dentro
+            for v in data.values():
+                if isinstance(v, list) and all(isinstance(it, dict) for it in v):
+                    return v
+            # se não achou, e se o dict em si já parece um "item", embrulha em lista
+            return [data] if data else []
+
+        # 3) Se vier lista pura
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+
+        # 4) Qualquer outro formato: retorna vazio
+        return []
 
     def get_issue(self, issue_id: str) -> Dict[str, Any]:
         url = f"{self.base_url}/api/v1/issues/{issue_id}"
