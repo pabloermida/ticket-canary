@@ -121,6 +121,8 @@ class AgideskClient:
             "periodfield": "created_at",
             "initialdate": ds_time(start),
             "finaldate": ds_time(end),
+            "forecast": "teams",
+            "team_id": 1
         }
         url = f"{self.base_url}/api/v1/issues"
         data = http_get_json(url, headers=self._headers(), params=params)
