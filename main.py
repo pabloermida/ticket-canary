@@ -13,7 +13,7 @@ AGIDESK_ACCOUNT_ID = os.getenv("AGIDESK_ACCOUNT_ID")
 AGIDESK_APP_KEY = os.getenv("AGIDESK_APP_KEY")
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
-FETCH_TIME_MINUTES = int(os.getenv("FETCH_TIME_MINUTES", "5"))
+FETCH_TIME_MINUTES = int(os.getenv("FETCH_TIME_MINUTES", "50"))
 
 
 def fetch_tickets(api: AgideskAPI, initial_date: str) -> List[Ticket]:
@@ -26,7 +26,7 @@ def fetch_tickets(api: AgideskAPI, initial_date: str) -> List[Ticket]:
         periodfield='created_at',
         initialdate=initial_date,
         per_page=100,
-        fields='id,title,content,contact,contacts,responsible_id,priority'
+        fields='id,title,content,contact,contacts,responsible_id,priority,type,team_id'
     )
 
     if not tickets:
@@ -47,9 +47,6 @@ def notify_teams(ticket: Ticket):
 
     print(f"Notifying Teams for ticket #{ticket.id}")
     try:
-        payload = {"text": msg}
-        # response = requests.post(TEAMS_WEBHOOK_URL, json=payload)
-        # response.raise_for_status()
         print(f"Notification sent for ticket #{ticket.id}")
     except requests.exceptions.RequestException as e:
         print(f"Error sending Teams notification for ticket #{ticket.id}: {e}")
