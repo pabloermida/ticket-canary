@@ -286,6 +286,7 @@ def main() -> None:
                 period='today', 
                 per_page=100,
                 # team=[ID_TIME_SERVICOS], # nao podemos filtrar por team
+                fields='id,title,content,htmlcontent,created_at,lists'
             )
             logging.info(f"Encontrados {len(issues)} tickets.")
 
