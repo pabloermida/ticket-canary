@@ -3,13 +3,12 @@
 Add environment variables:
 
 - Cria venv local.
-- export MOCK=0 # para usar so open ai e teams
-- export AGIDESK_BASE_URL="https://SEU_TENANT.agidesk.com"
-- export AGIDESK_API_TOKEN="SEU_TOKEN"
+- export AGIDESK_ACCOUNT_ID="infiniit"
+- export AGIDESK_APP_KEY="SEU_TOKEN"
 - export TEAMS_WEBHOOK_URL="https://...incomingwebhook..."
 - export OPENAI_API_KEY="sk-..."
 - export OPENAI_MODEL="gpt-4.1-mini"
-- export OPENAI_STUB_IN_MOCK=0
-- python3 router.py
-
-- Run the script using `python3 main.py`
+- export ROUTER_PROCESSED_TAG="router:processed"
+- export POLL_INTERVAL_SEC="300"  # seconds
+- export FETCH_TIME_SECONDS="300"  # seconds
+- python3 main.py
