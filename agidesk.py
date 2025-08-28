@@ -22,6 +22,7 @@ class Ticket(BaseModel):
     id: str
     title: str
     content: Optional[str] = None
+    htmlcontent: Optional[str] = None
     created_at: Optional[str] = None
     lists: Optional[Dict[str, TicketList]] = None
 

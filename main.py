@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 import requests
 import logging
+import re
 
 try:
     from dotenv import load_dotenv
@@ -100,11 +101,22 @@ def within_last_seconds(created_at: str, seconds: int = 300) -> bool:
     return bool(dt) and (now_utc() - dt) <= timedelta(seconds=seconds)
 
 
+# ============ Funções de Extração de Imagem ============
+
+def extract_image_urls(html_content: str) -> list[str]:
+    """Extrai URLs de imagem de um conteúdo HTML."""
+    if not html_content:
+        return []
+    # Encontra todas as URLs de imagem dentro de tags <img>
+    urls = re.findall(r'<img [^>]*src="([^"]+)"', html_content)
+    return urls
+
 # ============ OpenAI (Responses API com Structured Outputs) ============
 
 def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
     """
     Chama a API da OpenAI para obter um resumo e uma solução para o ticket usando o modo JSON.
+    Inclui o processamento de imagens se houver.
     """
     system_text = (
         "Você é um engenheiro de suporte técnico especialista. Com base nas informações do ticket, "
@@ -113,6 +125,12 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
     )
     
     user_text = f"Título: {ticket.title}\nConteúdo: {ticket.content}"
+    image_urls = extract_image_urls(ticket.htmlcontent or "")
+
+    user_message_content: list[Dict[str, Any]] = [{"type": "text", "text": user_text}]
+    for url in image_urls:
+        user_message_content.append({"type": "image_url", "image_url": {"url": url}})
+        logging.info(f"Encontrada imagem para análise no ticket {ticket.id}: {url}")
 
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -122,8 +140,9 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_text},
-            {"role": "user", "content": user_text},
+            {"role": "user", "content": user_message_content},
         ],
+        "max_tokens": 1000,
     }
 
     try:
