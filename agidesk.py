@@ -73,6 +73,23 @@ class AgideskAPI:
         self.headers = {
             "X-Tenant-ID": account_id,
         }
+    
+    def _get(self, path: str, params: dict | None = None) -> dict | list:
+        url = f"{self.base_url}{path}"
+        p = {"app_key": self.app_key}
+        if params: p.update(params)
+        r = requests.get(url, headers=self.headers, params=p, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def list_taskfacts(self) -> list[dict]:
+        return list(self._get("/taskfacts"))
+
+    def list_taskcauses(self) -> list[dict]:
+        return list(self._get("/taskcauses"))
+
+    def list_taskactions(self) -> list[dict]:
+        return list(self._get("/taskactions"))
 
     def search_tickets(self, **kwargs) -> List[Ticket]:
         url = f"{self.base_url}/search/issues"

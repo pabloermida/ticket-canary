@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 import requests
 import logging
+import re
 
 try:
     from dotenv import load_dotenv
@@ -102,6 +103,49 @@ def within_last_seconds(created_at: str, seconds: int = 300) -> bool:
 
 # ============ OpenAI (Responses API com Structured Outputs) ============
 
+def call_openai_fca(issue: Ticket) -> dict:
+    system_text = (
+        "Você é um analista de suporte. Gere JSON com as chaves: "
+        "'facts' (lista de 1-5 fatos objetivos, curtos), "
+        "'causes' (lista de 1-5 causas prováveis, curtas), "
+        "'actions' (lista de 1-5 ações concretas, imperativas, curtas), "
+        "'problem_summary' e 'suggested_solution'."
+    )
+    user_text = json.dumps({
+        "title": issue.title,
+        "content": issue.content,
+        "created_at": issue.created_at
+    }, ensure_ascii=False)
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text}
+        ],
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=120)
+        r.raise_for_status()
+        content = r.json().get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        data = json.loads(content)
+        return {
+            "facts": data.get("facts", []),
+            "causes": data.get("causes", []),
+            "actions": data.get("actions", []),
+            "problem_summary": data.get("problem_summary", ""),
+            "suggested_solution": data.get("suggested_solution", ""),
+        }
+    except Exception as e:
+        logging.error(f"[AI FCA] {e}")
+        return {"facts": [], "causes": [], "actions": [],
+                "problem_summary": "Error generating FCA.",
+                "suggested_solution": "—"}
+
+
 def call_openai_simplified(issue: Ticket) -> Dict[str, str]:
     """
     Chama a API da OpenAI para obter um resumo e uma solução para o ticket usando o modo JSON.
@@ -182,6 +226,48 @@ def notify_teams(message: str) -> bool:
 
 # ============ Payload de update (Agidesk) ============
 
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+def _build_index(rows: list[dict]) -> dict[str, str]:
+    # aceita tanto {'id','title'} como variações
+    idx = {}
+    for r in rows:
+        rid = str(r.get("id") or r.get("ID") or r.get("Id"))
+        title = r.get("title") or r.get("name") or r.get("descricao") or r.get("description")
+        if rid and title:
+            idx[_norm(title)] = rid
+    return idx
+
+def _map_names_to_ids(names: list[str], index: dict[str, str]) -> list[str]:
+    ids = []
+    for n in names:
+        rid = index.get(_norm(n))
+        if rid and rid not in ids:
+            ids.append(rid)
+    return ids
+
+def build_fca_update_payload(ai: dict, facts_ids: list[str], causes_ids: list[str], actions_ids: list[str]) -> dict:
+    actiondescription = (
+        f"**Resumo do Problema (IA):**\n{ai.get('problem_summary','')}\n\n"
+        f"**Solução Sugerida (IA):**\n{ai.get('suggested_solution','')}\n\n"
+        f"**FCA (IA):**\n"
+        f"- Fatos: {', '.join(ai.get('facts', []))}\n"
+        f"- Causas: {', '.join(ai.get('causes', []))}\n"
+        f"- Ações: {', '.join(ai.get('actions', []))}\n"
+    )
+    # Conforme ajuda de “Atendimentos - Campos de formulários”, o PUT em /issues/{id}
+    # é o caminho para atualizar campos; e FCA usa listas obtidas via GET dos respectivos recursos.
+    # Estrutura mais comum: listas de IDs.
+    return {
+        "service": {
+            "actiondescription": actiondescription,
+            "facts": facts_ids,     # ex.: ["12","5"]
+            "causes": causes_ids,   # ex.: ["3"]
+            "actions": actions_ids  # ex.: ["8","11"]
+        }
+    }
+
 def build_agidesk_update_payload(ai_summary: Dict[str, str]) -> Dict[str, Any]:
     problem_summary = ai_summary.get("problem_summary", "")
     suggested_solution = ai_summary.get("suggested_solution", "")
@@ -199,6 +285,44 @@ def build_agidesk_update_payload(ai_summary: Dict[str, str]) -> Dict[str, Any]:
 
 
 # ============ Pipeline de 1 ticket ============
+
+def process_issue(agi_client, issue: Ticket) -> Optional[Dict[str, Any]]:
+    if not within_last_seconds(issue.created_at or "", FETCH_TIME_SECONDS): return None
+    if str(issue.team_id) != ID_TIME_SERVICOS: return None
+
+    notify_teams(f"Novo ticket recebido: ID {issue.id} - {issue.title}")
+
+    # (1) FCA via OpenAI
+    ai = call_openai_fca(issue)
+
+    # (2) Lookups FCA
+    try:
+        facts_ref   = agi_client.list_taskfacts()
+        causes_ref  = agi_client.list_taskcauses()
+        actions_ref = agi_client.list_taskactions()
+    except Exception as e:
+        logging.error(f"Lookup FCA failed: {e}")
+        facts_ref, causes_ref, actions_ref = [], [], []
+
+    facts_idx   = _build_index(facts_ref)
+    causes_idx  = _build_index(causes_ref)
+    actions_idx = _build_index(actions_ref)
+
+    facts_ids   = _map_names_to_ids(ai.get("facts", []), facts_idx)
+    causes_ids  = _map_names_to_ids(ai.get("causes", []), causes_idx)
+    actions_ids = _map_names_to_ids(ai.get("actions", []), actions_idx)
+
+    # (3) Payload + PUT
+    payload = build_fca_update_payload(ai, facts_ids, causes_ids, actions_ids)
+    try:
+        update_resp = agi_client.update_issue(issue.id, payload)
+        logging.info(f"[FCA] Ticket {issue.id} atualizado.")
+    except Exception as e:
+        update_resp = {"error": str(e)}
+        logging.error(f"[FCA] Falha ao atualizar ticket {issue.id}: {e}")
+
+    return {"issue_id": issue.id, "ai_fca": ai, "agidesk_update_response": update_resp}
+
 
 def process_issue(agi_client, issue: Ticket) -> Optional[Dict[str, Any]]:
     """
