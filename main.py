@@ -171,21 +171,17 @@ def notify_teams(message: str) -> bool:
         return False
 
 
-# ============ Payload de update (Agidesk) ============
-
-def build_agidesk_update_payload(ai_summary: Dict[str, str]) -> Dict[str, Any]:
+def build_ai_comment_html(ai_summary: Dict[str, str]) -> str:
     """
-    Constrói o payload para a atualização do ticket no Agidesk.
+    Constrói o conteúdo HTML para o comentário do Agidesk.
     """
     resumo = ai_summary.get('resumo_problema', 'N/A')
     solucao = ai_summary.get('sugestao_solucao', 'N/A')
     
-    action_description = (
+    return (
         f"<b>Resumo do Problema (IA):</b><br>{resumo}<br><br>"
         f"<b>Sugestão de Solução (IA):</b><br>{solucao}"
     )
-    
-    return {"issue": {"actions": [{"description": action_description}]}}
 
 
 # ============ Pipeline de 1 ticket ============
@@ -223,14 +219,17 @@ def process_issue(agi_client, issue: Ticket) -> Optional[Dict[str, Any]]:
     
     update_resp: Dict[str, Any] = {"status": "skipped in development mode"}
     # 3. Atualiza o ticket no Agidesk (somente em modo de produção)
-    if MODE == "production":
-        update_payload = build_agidesk_update_payload(ai_summary)
+    if MODE == "production" or issue.id == "3315":
+        comment_html = build_ai_comment_html(ai_summary)
         try:
-            update_resp = agi_client.update_issue(issue.id, update_payload)
-            logging.info(f"Ticket {issue.id} atualizado no Agidesk com resumo da IA.")
+            update_resp = agi_client.add_comment(issue.id, comment_html)
+            logging.info(f"Comentário da IA adicionado ao ticket {issue.id} no Agidesk.")
         except Exception as e:
             update_resp = {"error": str(e)}
-            logging.error(f"Falha ao atualizar ticket {issue.id} no Agidesk: {e}")
+            logging.error(f"Falha ao adicionar comentário ao ticket {issue.id} no Agidesk: {e}")
+    else:
+        logging.info(f"Skipping update for ticket {issue.id} (not the test ticket 3315).")
+        update_resp = {"status": "skipped, not test ticket"}
 
     return {
         "issue_id": issue.id,
@@ -268,7 +267,6 @@ def main() -> None:
                 period='today', 
                 per_page=100,
                 # team=[ID_TIME_SERVICOS], # nao podemos filtrar por team
-                fields='id,title,content,created_at,team_id,lists'
             )
             logging.info(f"Encontrados {len(issues)} tickets.")
 

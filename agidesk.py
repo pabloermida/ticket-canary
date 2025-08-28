@@ -94,18 +94,24 @@ class AgideskAPI:
             print(f"Error decoding JSON for ticket {issue_id}: {e}")
             return None
 
-    def update_issue(self, issue_id: str, payload: Dict) -> Dict:
-        """Updates a ticket."""
-        url = f"{self.base_url}/issues/{issue_id}"
+    def add_comment(self, issue_id: str, html_content: str) -> Dict:
+        """Adds a new internal comment to a ticket."""
+        url = f"{self.base_url}/comments"
         params = {'app_key': self.app_key}
+        payload = {
+            "module": "tasks",
+            "privacy_id": 2,
+            "htmlcontent": html_content,
+            "tasks": int(issue_id)
+        }
         try:
-            response = requests.put(url, headers=self.headers, params=params, json=payload, timeout=60)
+            response = requests.post(url, headers=self.headers, params=params, json=payload, timeout=60)
             response.raise_for_status()
             if response.text.strip():
                 return response.json()
             return {}
         except requests.exceptions.RequestException as e:
-            print(f"Error updating ticket {issue_id}: {e}")
+            print(f"Error adding comment to ticket {issue_id}: {e}")
             if 'response' in locals() and response.text:
                 print(f"Response body: {response.text}")
             raise
