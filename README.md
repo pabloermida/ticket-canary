@@ -11,4 +11,5 @@ Add environment variables:
 - export ROUTER_PROCESSED_TAG="router:processed"
 - export POLL_INTERVAL_SEC="300"  # seconds
 - export FETCH_TIME_SECONDS="300"  # seconds
+- export MODE="development" # Use 'production' to enable write operations
 - python3 main.py

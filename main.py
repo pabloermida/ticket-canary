@@ -34,24 +34,32 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 POLL_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL", "300"))
 FETCH_TIME_SECONDS = int(os.getenv("FETCH_TIME_SECONDS", "300"))  # 5 minutes in seconds
 
+MODE = os.getenv("MODE", "development")  # Default to 'development' for safety
+
 ID_TIME_SERVICOS = "1"
 
 PROCESSED_IDS_FILE = "processed_ids.json"
 
 
 def load_processed_ids() -> set[str]:
+    """
+    Carrega os IDs dos tickets processados do arquivo JSON.
+    """
     if not os.path.exists(PROCESSED_IDS_FILE):
         return set()
+    
     try:
         with open(PROCESSED_IDS_FILE, "r") as f:
             return set(json.load(f))
-    except json.JSONDecodeError:
-        logging.warning(f"Error decoding {PROCESSED_IDS_FILE}, starting with empty set.")
+    except (json.JSONDecodeError, IOError) as e:
+        logging.warning(f"Não foi possível ler o arquivo de IDs processados: {e}")
         return set()
 
 
-def save_processed_id(ticket_id: str, processed_ids: set[str]):
-    processed_ids.add(ticket_id)
+def save_processed_ids(processed_ids: set[str]):
+    """
+    Salva o conjunto de IDs de tickets processados no arquivo JSON.
+    """
     with open(PROCESSED_IDS_FILE, "w") as f:
         json.dump(list(processed_ids), f)
 
@@ -249,7 +257,7 @@ def main() -> None:
         try:
             start_time = now_utc()
             initial_date = start_time - timedelta(seconds=FETCH_TIME_SECONDS)
-
+            
             issues = agi.search_tickets(
                 forecast='teams',
                 periodfield='created_at',
@@ -260,21 +268,35 @@ def main() -> None:
             )
             logging.info(f"Found {len(issues)} tickets.")
 
-            processed_count = 0
-            for issue in issues:
-                if str(issue.id) in processed_ids:
-                    continue
+            if MODE == "development":
+                logging.info("--- MODO DE DESENVOLVIMENTO ATIVADO (SOMENTE LEITURA) ---")
+                logging.info(f"Encontrados {len(issues)} tickets (sem processamento):")
+                for issue in issues:
+                    print(f"  - ID: {issue.id}, Título: {issue.title}")
+            elif MODE == "production":
+                logging.info("--- MODO DE PRODUÇÃO ATIVADO (LEITURA E ESCRITA) ---")
+                current_run_processed_ids = set()
+                for issue in issues:
+                    if str(issue.id) in processed_ids:
+                        continue
 
-                result = process_issue(agi, issue)
-                if result:
-                    print(json.dumps(result, ensure_ascii=False, indent=2))
-                    save_processed_id(str(issue.id), processed_ids)
-                    processed_count += 1
-            
-            if processed_count == 0 and issues:
-                logging.info("Nenhum ticket foi processado (todos foram filtrados)")
-            elif processed_count > 0:
-                logging.info(f"Processados {processed_count} tickets")
+                    result = process_issue(agi, issue)
+                    if result:
+                        print(json.dumps(result, ensure_ascii=False, indent=2))
+                        current_run_processed_ids.add(str(issue.id))
+                
+                if current_run_processed_ids:
+                    save_processed_ids(current_run_processed_ids)
+                    logging.info(f"Salvo {len(current_run_processed_ids)} novos IDs processados.")
+
+                processed_count = len(current_run_processed_ids)
+                if processed_count == 0 and issues:
+                    logging.info("Nenhum ticket novo foi processado (todos já foram vistos ou foram filtrados)")
+                elif processed_count > 0:
+                    logging.info(f"Processados {processed_count} novos tickets")
+            else:
+                logging.error(f"Modo '{MODE}' inválido. Use 'development' ou 'production'.")
+                
         except Exception as e:
             logging.error(f"An error occurred: {e}")
         
