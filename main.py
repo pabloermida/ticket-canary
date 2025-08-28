@@ -36,7 +36,7 @@ FETCH_TIME_SECONDS = int(os.getenv("FETCH_TIME_SECONDS"))
 
 MODE = os.getenv("MODE", "development")  # Default to 'development' for safety
 
-ID_TIME_SERVICOS = "1"
+ID_BOARD_SERVICOS = "9"
 
 PROCESSED_IDS_FILE = "processed_ids.json"
 
@@ -102,22 +102,17 @@ def within_last_seconds(created_at: str, seconds: int = 300) -> bool:
 
 # ============ OpenAI (Responses API com Structured Outputs) ============
 
-def call_openai_simplified(issue: Ticket) -> Dict[str, str]:
+def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
     """
     Chama a API da OpenAI para obter um resumo e uma solução para o ticket usando o modo JSON.
     """
     system_text = (
-        "You are an expert technical support engineer. Based on the ticket information, "
-        "provide a JSON object with two keys: 'problem_summary' (a short, clear summary "
-        "of the user's problem) and 'suggested_solution' (a possible solution or steps to solve it)."
+        "Você é um engenheiro de suporte técnico especialista. Com base nas informações do ticket, "
+        "forneça um objeto JSON com duas chaves: 'resumo_problema' (um resumo curto e claro "
+        "do problema do usuário) e 'sugestao_solucao' (uma possível solução ou passos para resolvê-lo)."
     )
     
-    issue_data = {
-        "title": issue.title,
-        "content": issue.content,
-        "created_at": issue.created_at
-    }
-    user_text = json.dumps(issue_data, ensure_ascii=False)
+    user_text = f"Título: {ticket.title}\nConteúdo: {ticket.content}"
 
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -138,20 +133,16 @@ def call_openai_simplified(issue: Ticket) -> Dict[str, str]:
         data = r.json()
         response_content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
         
-        response_json = json.loads(response_content)
-        return {
-            "problem_summary": response_json.get("problem_summary", ""),
-            "suggested_solution": response_json.get("suggested_solution", "")
-        }
+        ai_summary = json.loads(response_content)
+        logging.info(f"Resposta da IA para o ticket {ticket.id}: {ai_summary}")
+        return ai_summary
+
     except requests.RequestException as e:
-        logging.error(f"Error calling OpenAI API: {e}")
+        logging.error(f"Erro ao chamar a API da OpenAI: {e}")
     except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logging.error(f"Failed to parse OpenAI response: {e}")
+        logging.error(f"Falha ao analisar a resposta da OpenAI: {e}")
     
-    return {
-        "problem_summary": "Error: Could not process AI response.",
-        "suggested_solution": "Could not retrieve a valid solution from the AI."
-    }
+    return {"resumo_problema": "Erro: Não foi possível processar a resposta da IA.", "sugestao_solucao": "N/A"}
 
 
 # ============ Teams Webhook ============
@@ -183,55 +174,63 @@ def notify_teams(message: str) -> bool:
 # ============ Payload de update (Agidesk) ============
 
 def build_agidesk_update_payload(ai_summary: Dict[str, str]) -> Dict[str, Any]:
-    problem_summary = ai_summary.get("problem_summary", "")
-    suggested_solution = ai_summary.get("suggested_solution", "")
-
-    actiondescription = (
-        f"**Resumo do Problema (IA):**\n{problem_summary}\n\n"
-        f"**Solução Sugerida (IA):**\n{suggested_solution}\n"
+    """
+    Constrói o payload para a atualização do ticket no Agidesk.
+    """
+    resumo = ai_summary.get('resumo_problema', 'N/A')
+    solucao = ai_summary.get('sugestao_solucao', 'N/A')
+    
+    action_description = (
+        f"<b>Resumo do Problema (IA):</b><br>{resumo}<br><br>"
+        f"<b>Sugestão de Solução (IA):</b><br>{solucao}"
     )
-
-    return {
-        "service": {
-            "actiondescription": actiondescription,
-        }
-    }
+    
+    return {"issue": {"actions": [{"description": action_description}]}}
 
 
 # ============ Pipeline de 1 ticket ============
 
 def process_issue(agi_client, issue: Ticket) -> Optional[Dict[str, Any]]:
     """
-    Processa um ticket se passar na validação.
-    Retorna None se o ticket não passar na validação.
+    Processa um ticket se passar na validação. As ações executadas dependem do MODE.
     """
     # Validação do ticket
-    if not within_last_seconds(issue.created_at or "", FETCH_TIME_SECONDS):
-        logging.debug(f"Ticket {issue.id} fora da janela de tempo")
-        return None
+    # if not within_last_seconds(issue.created_at or "", FETCH_TIME_SECONDS):
+    #     logging.debug(f"Ticket {issue.id} fora da janela de tempo")
+    #     return None
     
-    if str(issue.team_id) != ID_TIME_SERVICOS:
-        logging.debug(f"Ticket {issue.id} não é do time de serviços")
+    # Checa se o ticket pertence ao board 'Time Suporte' (ID_BOARD_SERVICOS)
+    board_found = False
+    if issue.lists:
+        board_found = any(
+            ticket_list.boards and ID_BOARD_SERVICOS in ticket_list.boards
+            for ticket_list in issue.lists.values()
+        )
+
+    if not board_found:
+        logging.debug(f"Ticket {issue.id} não pertence ao board {ID_BOARD_SERVICOS}.")
         return None
 
+    # 1. Notifica o Teams (executado em ambos os modos)
     notification_text = f"Novo ticket recebido: ID {issue.id} - {issue.title}"
     if notify_teams(notification_text):
         logging.info(f"✅ Notificação para o ticket {issue.id} enviada ao Teams")
     else:
         logging.error(f"❌ Falha ao enviar notificação para o ticket {issue.id} ao Teams")
 
-    # 2. Obtém o resumo da IA
+    # 2. Obtém o resumo da IA (executado em ambos os modos)
     ai_summary = call_openai_simplified(issue)
     
-    # 3. Atualiza o ticket no Agidesk com o conteúdo da IA
-    update_payload = build_agidesk_update_payload(ai_summary)
-    
-    try:
-        update_resp = agi_client.update_issue(issue.id, update_payload)
-        logging.info(f"Ticket {issue.id} atualizado no Agidesk com resumo da IA.")
-    except Exception as e:
-        update_resp = {"error": str(e)}
-        logging.error(f"Falha ao atualizar ticket {issue.id} no Agidesk: {e}")
+    update_resp: Dict[str, Any] = {"status": "skipped in development mode"}
+    # 3. Atualiza o ticket no Agidesk (somente em modo de produção)
+    if MODE == "production":
+        update_payload = build_agidesk_update_payload(ai_summary)
+        try:
+            update_resp = agi_client.update_issue(issue.id, update_payload)
+            logging.info(f"Ticket {issue.id} atualizado no Agidesk com resumo da IA.")
+        except Exception as e:
+            update_resp = {"error": str(e)}
+            logging.error(f"Falha ao atualizar ticket {issue.id} no Agidesk: {e}")
 
     return {
         "issue_id": issue.id,
@@ -251,7 +250,6 @@ def main() -> None:
 
     logging.info("--- Starting Ticket Canary ---")
 
-    processed_ids = load_processed_ids()
     agi = AgideskAPI(account_id=AGIDESK_ACCOUNT_ID, app_key=AGIDESK_APP_KEY)
     while True:
         try:
@@ -259,46 +257,52 @@ def main() -> None:
             time_ago = start_time - timedelta(seconds=FETCH_TIME_SECONDS)
             initial_date_str = time_ago.strftime('%Y-%m-%d %H:%M:%S')
 
+            # Carrega os IDs da última execução para evitar duplicados
+            processed_ids = load_processed_ids()
+            
+            # Lógica principal de processamento
             issues = agi.search_tickets(
-                forecast='teams',
+                forecast='inbox', # all, inbox, myaction
                 # periodfield='created_at', # comentado para testes
                 # initialdate=initial_date_str, # comentado para testes
                 period='today', 
                 per_page=100,
-                team=[ID_TIME_SERVICOS],
-                fields='id,title,content,contact,contacts,responsible_id,priority,type,team_id'
+                # team=[ID_TIME_SERVICOS], # nao podemos filtrar por team
+                fields='id,title,content,created_at,team_id,lists'
             )
-            logging.info(f"Found {len(issues)} tickets.")
+            logging.info(f"Encontrados {len(issues)} tickets.")
 
-            current_run_processed_ids = set()
+            # Lógica para identificar e processar novos tickets
             new_tickets = []
             for issue in issues:
                 if str(issue.id) not in processed_ids:
                     new_tickets.append(issue)
-                    current_run_processed_ids.add(str(issue.id))
-
+            
             logging.info(f"Encontrados {len(new_tickets)} novos tickets para processar.")
 
             if MODE == "development":
-                logging.info("--- MODO DE DESENVOLVIMENTO ATIVADO (SOMENTE LEITURA) ---")
-                for issue in new_tickets:
-                    print(f"  - NOVO TICKET ID: {issue.id}, Título: {issue.title}")
-
+                logging.info("--- MODO DE DESENVOLVIMENTO ATIVADO (Agidesk update desativado) ---")
             elif MODE == "production":
                 logging.info("--- MODO DE PRODUÇÃO ATIVADO (LEITURA E ESCRITA) ---")
-                for issue in new_tickets:
-                    result = process_issue(agi, issue)
-                    if result:
-                        print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                logging.error(f"Modo '{MODE}' inválido. Use 'development' ou 'production'.")
+                return # Sai se o modo for inválido
+
+            for issue in new_tickets:
+                result = process_issue(agi, issue)
+                if result:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
             
-            if current_run_processed_ids:
-                save_processed_ids(current_run_processed_ids)
-                logging.info(f"Salvo {len(current_run_processed_ids)} novos IDs processados.")
+            # Sobrescreve o arquivo de estado com TODOS os IDs da busca ATUAL
+            all_ids_from_current_fetch = {str(issue.id) for issue in issues}
+            if all_ids_from_current_fetch:
+                save_processed_ids(all_ids_from_current_fetch)
+                logging.info(f"Arquivo de estado atualizado com {len(all_ids_from_current_fetch)} IDs da busca atual.")
             
         except Exception as e:
-            logging.error(f"An error occurred: {e}")
+            logging.error(f"Ocorreu um erro no ciclo de polling: {e}")
         
-        logging.info(f"Finished check. Waiting for {POLL_INTERVAL_SEC} seconds...")
+        logging.info(f"Ciclo concluído. Aguardando {POLL_INTERVAL_SEC} segundos...")
         time.sleep(POLL_INTERVAL_SEC)
 
 

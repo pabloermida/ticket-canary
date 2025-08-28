@@ -5,61 +5,25 @@ import requests
 import json
 import time
 from datetime import datetime
-from typing import List, Optional, Dict, Union
+from typing import List, Optional, Dict, Union, Any
 from pydantic import BaseModel
 
 
-class TicketTeam(BaseModel):
+class Board(BaseModel):
     id: str
     title: str
-    fulltitle: Optional[str] = None
 
-class TicketPriority(BaseModel):
+class TicketList(BaseModel):
     id: str
     title: str
-    fulltitle: Optional[str] = None
-
-class TicketCustomer(BaseModel):
-    id: str
-    title: str
-    fulltitle: Optional[str] = None
-    email: Optional[str] = None
-
-class TicketContact(BaseModel):
-    id: str
-    title: str
-    fulltitle: Optional[str] = None
-    email: Optional[str] = None
-    
-class TicketService(BaseModel):
-    id: str
-    title: str
-    fulltitle: Optional[str] = None
+    boards: Optional[Dict[str, Board]] = None
 
 class Ticket(BaseModel):
     id: str
     title: str
-    fulltitle: Optional[str] = None
     content: Optional[str] = None
-    htmlcontent: Optional[str] = None
-    active: Optional[str] = None
-    status_id: Optional[str] = None
-    type_id: Optional[str] = None
     created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-    duedate: Optional[str] = None
-    priority: Optional[Union[str, TicketPriority]] = None
-    priority_id: Optional[str] = None
-    responsible_id: Optional[str] = None
-    team_id: Optional[str] = None
-    contact: Optional[str] = None
-    customer: Optional[str] = None
-    service: Optional[str] = None
-    type: Optional[str] = None
-    team: Optional[Union[str, TicketTeam]] = None
-    customers: Optional[Dict[str, TicketCustomer]] = None
-    contacts: Optional[Dict[str, TicketContact]] = None
-    services: Optional[Dict[str, TicketService]] = None
+    lists: Optional[Dict[str, TicketList]] = None
 
 class AgideskAPI:
     """A wrapper for the Agidesk API"""
