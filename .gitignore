@@ -1,2 +1,3 @@
 .env
 api_responses.log
+processed_ids.json

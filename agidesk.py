@@ -75,9 +75,6 @@ class AgideskAPI:
         }
 
     def search_tickets(self, **kwargs) -> List[Ticket]:
-        """
-        [CORRECTED] Fetches tickets using the /search/issues endpoint.
-        """
         url = f"{self.base_url}/search/issues"
         
         params = kwargs.copy()
@@ -117,3 +114,34 @@ class AgideskAPI:
         except (ValueError, json.JSONDecodeError) as e:
             print(f"Error decoding JSON from search/issues endpoint: {e}")
             return []
+
+    def get_issue(self, issue_id: str) -> Optional[Ticket]:
+        """Fetches a single ticket by its ID."""
+        url = f"{self.base_url}/issues/{issue_id}"
+        params = {'app_key': self.app_key}
+        try:
+            response = requests.get(url, headers=self.headers, params=params, timeout=30)
+            response.raise_for_status()
+            return Ticket.model_validate(response.json())
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching ticket {issue_id}: {e}")
+            return None
+        except (ValueError, json.JSONDecodeError) as e:
+            print(f"Error decoding JSON for ticket {issue_id}: {e}")
+            return None
+
+    def update_issue(self, issue_id: str, payload: Dict) -> Dict:
+        """Updates a ticket."""
+        url = f"{self.base_url}/issues/{issue_id}"
+        params = {'app_key': self.app_key}
+        try:
+            response = requests.put(url, headers=self.headers, params=params, json=payload, timeout=60)
+            response.raise_for_status()
+            if response.text.strip():
+                return response.json()
+            return {}
+        except requests.exceptions.RequestException as e:
+            print(f"Error updating ticket {issue_id}: {e}")
+            if 'response' in locals() and response.text:
+                print(f"Response body: {response.text}")
+            raise
