@@ -75,9 +75,6 @@ class AgideskAPI:
         }
 
     def search_tickets(self, **kwargs) -> List[Ticket]:
-        """
-        [CORRECTED] Fetches tickets using the /search/issues endpoint.
-        """
         url = f"{self.base_url}/search/issues"
         
         params = kwargs.copy()

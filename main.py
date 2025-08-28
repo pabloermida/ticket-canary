@@ -32,7 +32,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 POLL_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL", "300"))
-FETCH_TIME_SECONDS = int(os.getenv("FETCH_TIME_SECONDS", "300"))  # 5 minutes in seconds
+FETCH_TIME_SECONDS = int(os.getenv("FETCH_TIME_SECONDS"))
 
 MODE = os.getenv("MODE", "development")  # Default to 'development' for safety
 
@@ -256,47 +256,45 @@ def main() -> None:
     while True:
         try:
             start_time = now_utc()
-            initial_date = start_time - timedelta(seconds=FETCH_TIME_SECONDS)
-            
+            time_ago = start_time - timedelta(seconds=FETCH_TIME_SECONDS)
+            initial_date_str = time_ago.strftime('%Y-%m-%d %H:%M:%S')
+
             issues = agi.search_tickets(
                 forecast='teams',
-                periodfield='created_at',
-                initialdate=initial_date,
+                # periodfield='created_at', # comentado para testes
+                # initialdate=initial_date_str, # comentado para testes
+                period='today', 
                 per_page=100,
                 team=[ID_TIME_SERVICOS],
                 fields='id,title,content,contact,contacts,responsible_id,priority,type,team_id'
             )
             logging.info(f"Found {len(issues)} tickets.")
 
+            current_run_processed_ids = set()
+            new_tickets = []
+            for issue in issues:
+                if str(issue.id) not in processed_ids:
+                    new_tickets.append(issue)
+                    current_run_processed_ids.add(str(issue.id))
+
+            logging.info(f"Encontrados {len(new_tickets)} novos tickets para processar.")
+
             if MODE == "development":
                 logging.info("--- MODO DE DESENVOLVIMENTO ATIVADO (SOMENTE LEITURA) ---")
-                logging.info(f"Encontrados {len(issues)} tickets (sem processamento):")
-                for issue in issues:
-                    print(f"  - ID: {issue.id}, Título: {issue.title}")
+                for issue in new_tickets:
+                    print(f"  - NOVO TICKET ID: {issue.id}, Título: {issue.title}")
+
             elif MODE == "production":
                 logging.info("--- MODO DE PRODUÇÃO ATIVADO (LEITURA E ESCRITA) ---")
-                current_run_processed_ids = set()
-                for issue in issues:
-                    if str(issue.id) in processed_ids:
-                        continue
-
+                for issue in new_tickets:
                     result = process_issue(agi, issue)
                     if result:
                         print(json.dumps(result, ensure_ascii=False, indent=2))
-                        current_run_processed_ids.add(str(issue.id))
-                
-                if current_run_processed_ids:
-                    save_processed_ids(current_run_processed_ids)
-                    logging.info(f"Salvo {len(current_run_processed_ids)} novos IDs processados.")
-
-                processed_count = len(current_run_processed_ids)
-                if processed_count == 0 and issues:
-                    logging.info("Nenhum ticket novo foi processado (todos já foram vistos ou foram filtrados)")
-                elif processed_count > 0:
-                    logging.info(f"Processados {processed_count} novos tickets")
-            else:
-                logging.error(f"Modo '{MODE}' inválido. Use 'development' ou 'production'.")
-                
+            
+            if current_run_processed_ids:
+                save_processed_ids(current_run_processed_ids)
+                logging.info(f"Salvo {len(current_run_processed_ids)} novos IDs processados.")
+            
         except Exception as e:
             logging.error(f"An error occurred: {e}")
         
