@@ -1,0 +1,15 @@
+{
+	"IsEncrypted": false,
+	"Values": {
+		"AzureWebJobsStorage": "UseDevelopmentStorage=true",
+		"FUNCTIONS_WORKER_RUNTIME": "python",
+		"AGIDESK_ACCOUNT_ID": "infiniit",
+		"AGIDESK_APP_KEY": "",
+		"TEAMS_WEBHOOK_URL": "",
+		"OPENAI_API_KEY": "",
+		"OPENAI_MODEL": "gpt-4o-mini",
+		"FETCH_TIME_SECONDS": "300",
+		"MODE": "development",
+		"AZURE_STORAGE_CONNECTION_STRING": ""
+	}
+}
