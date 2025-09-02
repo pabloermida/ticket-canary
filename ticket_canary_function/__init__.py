@@ -8,7 +8,9 @@ import requests
 import azure.functions as func
 from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
 
-from .agidesk import AgideskAPI, Ticket
+# Import the shared module from the app root. Relative import would fail
+# because agidesk.py lives at the repository root, not inside this package.
+from agidesk import AgideskAPI, Ticket
 
 # Configuration
 AGIDESK_ACCOUNT_ID = os.getenv("AGIDESK_ACCOUNT_ID", "")
