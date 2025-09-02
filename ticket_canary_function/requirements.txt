@@ -1,0 +1,4 @@
+requests
+pydantic
+azure-functions
+azure-storage-blob
