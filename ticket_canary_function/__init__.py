@@ -22,7 +22,11 @@ FETCH_TIME_SECONDS = int(os.getenv("FETCH_TIME_SECONDS", "300"))
 MODE = os.getenv("MODE", "development")
 ID_BOARD_SERVICOS = "9"
 PROCESSED_IDS_BLOB_NAME = "processed_ids.json"
-AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+# Prefer explicit app setting, but fall back to the platform default setting
+AZURE_STORAGE_CONNECTION_STRING = (
+    os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    or os.getenv("AzureWebJobsStorage")
+)
 CONTAINER_NAME = "ticket-canary-state"
 
 
@@ -194,8 +198,10 @@ def main(timer: func.TimerRequest) -> None:
     utc_timestamp = datetime.now(timezone.utc).isoformat()
     logging.info(f'Python timer trigger function ran at {utc_timestamp}')
 
-    required_vars = ["AGIDESK_ACCOUNT_ID", "AGIDESK_APP_KEY", "TEAMS_WEBHOOK_URL", "AZURE_STORAGE_CONNECTION_STRING"]
+    required_vars = ["AGIDESK_ACCOUNT_ID", "AGIDESK_APP_KEY", "TEAMS_WEBHOOK_URL"]
     missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if not AZURE_STORAGE_CONNECTION_STRING:
+        missing_vars.append("AZURE_STORAGE_CONNECTION_STRING or AzureWebJobsStorage")
     if missing_vars:
         logging.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         return
