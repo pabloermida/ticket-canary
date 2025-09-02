@@ -26,11 +26,18 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies (sanity)
+      - name: Build dependencies into .python_packages
         run: |
           python -m pip install --upgrade pip
-          # Install from root to mirror what Azure will use
-          pip install -r requirements.txt
+          python -m pip --version
+          # Vendor dependencies for Azure Functions (Linux Consumption)
+          pip install -r requirements.txt -t .python_packages/lib/site-packages
+          # Show a couple of key packages to verify vendoring
+          python - << 'PY'
+          import pkgutil, sys
+          print('site:', sys.version)
+          print('vendored:', 'requests' in {m.name for m in pkgutil.iter_modules([".python_packages/lib/site-packages"])})
+          PY
       
       - name: Login to Azure
         uses: azure/login@v2
