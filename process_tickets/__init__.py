@@ -189,7 +189,7 @@ def process_issue(agi_client: AgideskAPI, issue: Ticket) -> Optional[Dict[str, A
 
 
 def main(timer: func.TimerRequest) -> None:
-    utc_timestamp = datetime.utcnow().isoformat()
+    utc_timestamp = datetime.now(timezone.utc).isoformat()
     logging.info(f'Python timer trigger function ran at {utc_timestamp}')
 
     required_vars = ["AGIDESK_ACCOUNT_ID", "AGIDESK_APP_KEY", "TEAMS_WEBHOOK_URL", "AZURE_STORAGE_CONNECTION_STRING"]
