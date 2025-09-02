@@ -169,7 +169,7 @@ def process_issue(agi_client: AgideskAPI, issue: Ticket) -> Optional[Dict[str, A
     ai_summary = call_openai_simplified(issue)
     
     update_resp: Dict[str, Any] = {"status": "skipped in development mode"}
-    if MODE == "production" or issue.id == "3315":
+    if MODE == "production" or issue.id == "3315": #TODO: remove testing hard code
         comment_html = build_ai_comment_html(ai_summary)
         try:
             update_resp = agi_client.add_comment(issue.id, comment_html)
