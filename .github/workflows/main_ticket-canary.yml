@@ -26,10 +26,11 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
+      - name: Install dependencies (sanity)
         run: |
           python -m pip install --upgrade pip
-          pip install -r ticket_canary_function/requirements.txt
+          # Install from root to mirror what Azure will use
+          pip install -r requirements.txt
       
       - name: Login to Azure
         uses: azure/login@v2
@@ -42,5 +43,6 @@ jobs:
         uses: Azure/functions-action@v1
         with:
           app-name: 'ticket-canary'
-          package: 'ticket_canary_function' 
+          # Package the repo root so host.json and shared modules are included
+          package: '.'
           
