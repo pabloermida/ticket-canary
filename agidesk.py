@@ -6,7 +6,7 @@ import json
 import time
 from datetime import datetime
 from typing import List, Optional, Dict, Union, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class Board(BaseModel):
@@ -18,12 +18,58 @@ class TicketList(BaseModel):
     title: str
     boards: Optional[Dict[str, Board]] = None
 
+    @field_validator('boards', mode='before')
+    @classmethod
+    def normalize_boards(cls, v):
+        """Accept dict or list for boards; coerce list -> dict keyed by id."""
+        if v is None or v == {}:
+            return None
+        if isinstance(v, list):
+            if not v:
+                return None
+            out: Dict[str, Any] = {}
+            for item in v:
+                if isinstance(item, dict):
+                    bid = item.get('id') or item.get('board_id') or item.get('slug')
+                    if bid is not None:
+                        out[str(bid)] = item
+            return out or None
+        if isinstance(v, dict):
+            return v
+        return None
+
 class Ticket(BaseModel):
     id: str
     title: str
     content: Optional[str] = None
     created_at: Optional[str] = None
     lists: Optional[Dict[str, TicketList]] = None
+    customer: Optional[str] = None
+    contact: Optional[str] = None
+
+    @field_validator('lists', mode='before')
+    @classmethod
+    def normalize_lists(cls, v):
+        """Accept dict or list for lists; coerce list -> dict keyed by id.
+
+        Some Agidesk responses return `lists: []` or `lists: [{...}]` rather than
+        an object. This normalizes to the dict shape our code expects.
+        """
+        if v is None or v == {}:
+            return None
+        if isinstance(v, list):
+            if not v:
+                return None
+            out: Dict[str, Any] = {}
+            for item in v:
+                if isinstance(item, dict):
+                    lid = item.get('id') or item.get('list_id') or item.get('slug')
+                    if lid is not None:
+                        out[str(lid)] = item
+            return out or None
+        if isinstance(v, dict):
+            return v
+        return None
 
 class AgideskAPI:
     """A wrapper for the Agidesk API"""

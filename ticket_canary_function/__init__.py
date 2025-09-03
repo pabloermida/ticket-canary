@@ -3,6 +3,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
+from textwrap import shorten
 
 import requests
 import azure.functions as func
@@ -22,7 +23,17 @@ FETCH_TIME_SECONDS = int(os.getenv("FETCH_TIME_SECONDS", "300"))
 MODE = os.getenv("MODE", "development")
 ID_BOARD_SERVICOS = "9"
 PROCESSED_IDS_BLOB_NAME = "processed_ids.json"
-AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+# Optional: Build a direct ticket URL for card actions
+# Default to the known Agidesk customer portal pattern; override via env if needed
+AGIDESK_TICKET_URL_TEMPLATE = os.getenv(
+    "AGIDESK_TICKET_URL_TEMPLATE",
+    "https://cliente.infiniit.com.br/br/painel/atendimento/{id}",
+)
+# Prefer explicit app setting, but fall back to the platform default setting
+AZURE_STORAGE_CONNECTION_STRING = (
+    os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    or os.getenv("AzureWebJobsStorage")
+)
 CONTAINER_NAME = "ticket-canary-state"
 
 
@@ -142,6 +153,183 @@ def notify_teams(message: str) -> bool:
         return False
 
 
+def notify_teams_adaptive(card: Dict[str, Any]) -> bool:
+    """Send an Adaptive Card to Teams via Incoming Webhook.
+
+    Teams webhooks accept Adaptive Cards wrapped as an attachment.
+    Falls back to sending plain text if posting the card fails.
+    """
+    if not TEAMS_WEBHOOK_URL:
+        logging.error("TEAMS_WEBHOOK_URL is not configured.")
+        return False
+
+    wrapper = {
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": None,
+                "content": card,
+            }
+        ],
+    }
+
+    try:
+        response = requests.post(TEAMS_WEBHOOK_URL, json=wrapper, timeout=30)
+        if response.status_code == 200:
+            logging.info("Adaptive Card sent to Teams successfully.")
+            return True
+        else:
+            logging.error(f"Error sending Adaptive Card to Teams: {response.status_code} - {response.text}")
+            # Fallback to a simple text notification with the card's title, if available
+            title = next((b.get("text") for b in card.get("body", []) if isinstance(b, dict) and b.get("type") == "TextBlock"), None)
+            return notify_teams(title or "New notification (fallback)")
+    except requests.RequestException as e:
+        logging.error(f"Connection error with Teams (Adaptive Card): {e}")
+        return False
+
+
+def build_ticket_url(ticket_id: str) -> Optional[str]:
+    """Build a direct link to the ticket if a template is provided.
+
+    Example template: https://{account_id}.agidesk.com/tasks/{id}
+    """
+    template = AGIDESK_TICKET_URL_TEMPLATE.strip()
+    if not template:
+        return None
+    try:
+        return template.format(account_id=AGIDESK_ACCOUNT_ID, id=ticket_id)
+    except Exception as e:
+        logging.warning(f"Failed to render AGIDESK_TICKET_URL_TEMPLATE: {e}")
+        return None
+
+
+def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Create an Adaptive Card payload to display a ticket nicely in Teams."""
+    created_display = "N/A"
+    if ticket.created_at:
+        dt = parse_dt_loose(ticket.created_at)
+        if dt:
+            created_display = f"{ds_time(dt)} UTC"
+
+    # Derive list/board labels, if available
+    list_titles = []
+    board_titles = set()
+    if ticket.lists:
+        for tl in ticket.lists.values():
+            if getattr(tl, "title", None):
+                list_titles.append(tl.title)
+            if getattr(tl, "boards", None):
+                for b in tl.boards.values():
+                    if getattr(b, "title", None):
+                        board_titles.add(b.title)
+
+    facts = [
+        {"title": "ID", "value": str(ticket.id)},
+        {"title": "Criado", "value": created_display},
+    ]
+    if board_titles:
+        facts.append({"title": "Board", "value": ", ".join(sorted(board_titles))})
+    if list_titles:
+        facts.append({"title": "Lista", "value": ", ".join(sorted(set(list_titles)))})
+    # Add customer and contact if available
+    if getattr(ticket, "customer", None):
+        facts.append({"title": "Cliente", "value": str(ticket.customer)})
+    if getattr(ticket, "contact", None):
+        facts.append({"title": "Contato", "value": str(ticket.contact)})
+
+    content_snippet = None
+    if ticket.content:
+        # Trim content to keep the card tidy
+        content_snippet = shorten(ticket.content.strip(), width=500, placeholder="…")
+
+    resumo = ai_summary.get("resumo_problema") or "N/A"
+    sugestao = ai_summary.get("sugestao_solucao") or "N/A"
+
+    # Build actions
+    actions = []
+    ticket_url = build_ticket_url(ticket.id)
+    if ticket_url:
+        actions.append({
+            "type": "Action.OpenUrl",
+            "title": "Abrir no Agidesk",
+            "url": ticket_url,
+        })
+
+    card: Dict[str, Any] = {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "msteams": {"width": "Full"},
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": "Novo ticket recebido",
+                "wrap": True,
+                "weight": "Bolder",
+                "size": "Large",
+            },
+            {
+                "type": "TextBlock",
+                "text": ticket.title or "(Sem título)",
+                "wrap": True,
+                "size": "Medium",
+                "spacing": "Small",
+            },
+            {
+                "type": "FactSet",
+                "facts": facts,
+                "spacing": "Medium",
+            },
+        ],
+        "actions": actions,
+    }
+
+    if content_snippet:
+        card["body"].append({
+            "type": "TextBlock",
+            "text": "Descrição:",
+            "wrap": True,
+            "weight": "Bolder",
+            "spacing": "Medium",
+        })
+        card["body"].append({
+            "type": "TextBlock",
+            "text": content_snippet,
+            "wrap": True,
+            "spacing": "Small",
+        })
+
+    card["body"].extend([
+        {
+            "type": "TextBlock",
+            "text": "Resumo do Problema (IA):",
+            "wrap": True,
+            "weight": "Bolder",
+            "spacing": "Medium",
+        },
+        {
+            "type": "TextBlock",
+            "text": resumo,
+            "wrap": True,
+        },
+        {
+            "type": "TextBlock",
+            "text": "Sugestão de Solução (IA):",
+            "wrap": True,
+            "weight": "Bolder",
+            "spacing": "Medium",
+        },
+        {
+            "type": "TextBlock",
+            "text": sugestao,
+            "wrap": True,
+        },
+    ])
+
+    return card
+
+
 def build_ai_comment_html(ai_summary: Dict[str, str]) -> str:
     resumo = ai_summary.get('resumo_problema', 'N/A')
     solucao = ai_summary.get('sugestao_solucao', 'N/A')
@@ -162,13 +350,18 @@ def process_issue(agi_client: AgideskAPI, issue: Ticket) -> Optional[Dict[str, A
         logging.debug(f"Ticket {issue.id} does not belong to board {ID_BOARD_SERVICOS}.")
         return None
 
-    notification_text = f"New ticket received: ID {issue.id} - {issue.title}"
-    if notify_teams(notification_text):
-        logging.info(f"✅ Notification for ticket {issue.id} sent to Teams")
-    else:
-        logging.error(f"❌ Failed to send notification for ticket {issue.id} to Teams")
-
+    # First, get the AI summary to include in the card we post to Teams
     ai_summary = call_openai_simplified(issue)
+
+    # Build and send an Adaptive Card notification to Teams
+    try:
+        card = build_ticket_adaptive_card(issue, ai_summary)
+        if notify_teams_adaptive(card):
+            logging.info(f"✅ Adaptive Card for ticket {issue.id} sent to Teams")
+        else:
+            logging.error(f"❌ Failed to send Adaptive Card for ticket {issue.id} to Teams")
+    except Exception as e:
+        logging.error(f"Error building/sending Adaptive Card for ticket {issue.id}: {e}")
     
     update_resp: Dict[str, Any] = {"status": "skipped in development mode"}
     if MODE == "production" or issue.id == "3315": #TODO: remove testing hard code
@@ -194,8 +387,10 @@ def main(timer: func.TimerRequest) -> None:
     utc_timestamp = datetime.now(timezone.utc).isoformat()
     logging.info(f'Python timer trigger function ran at {utc_timestamp}')
 
-    required_vars = ["AGIDESK_ACCOUNT_ID", "AGIDESK_APP_KEY", "TEAMS_WEBHOOK_URL", "AZURE_STORAGE_CONNECTION_STRING"]
+    required_vars = ["AGIDESK_ACCOUNT_ID", "AGIDESK_APP_KEY", "TEAMS_WEBHOOK_URL"]
     missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if not AZURE_STORAGE_CONNECTION_STRING:
+        missing_vars.append("AZURE_STORAGE_CONNECTION_STRING or AzureWebJobsStorage")
     if missing_vars:
         logging.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         return
@@ -208,7 +403,7 @@ def main(timer: func.TimerRequest) -> None:
         processed_ids = load_processed_ids()
         issues = agi.search_tickets(
             forecast='inbox',
-            period='today',
+            period='today',#TODO change to 'last_5_minutes' after testing
             per_page=100,
         )
         logging.info(f"Found {len(issues)} tickets.")
