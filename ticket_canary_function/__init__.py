@@ -320,21 +320,14 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
         "wrap": True,
     })
 
-    # Link section
+    # Link section (now encourages using the button instead of inline link)
     card["body"].append({
         "type": "TextBlock",
-        "text": "\n👇 Clique para abrir o chamado:",
+        "text": "\n👇 Clique no botão abaixo para abrir o chamado:",
         "wrap": True,
         "spacing": "Medium",
     })
-    if ticket_url:
-        # Use markdown link so it displays text and is clickable
-        card["body"].append({
-            "type": "TextBlock",
-            "text": f"[Link para o Chamado]({ticket_url})",
-            "wrap": True,
-        })
-    else:
+    if not ticket_url:
         card["body"].append({
             "type": "TextBlock",
             "text": "(link não disponível)",
