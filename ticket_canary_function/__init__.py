@@ -153,7 +153,7 @@ def notify_teams(message: str) -> bool:
         return False
 
 
-def notify_teams_adaptive(card: Dict[str, Any]) -> bool:
+def notify_teams_adaptive(card: Dict[str, Any], fallback_message: Optional[str] = None) -> bool:
     """Send an Adaptive Card to Teams via Incoming Webhook.
 
     Teams webhooks accept Adaptive Cards wrapped as an attachment.
@@ -182,6 +182,8 @@ def notify_teams_adaptive(card: Dict[str, Any]) -> bool:
         else:
             logging.error(f"Error sending Adaptive Card to Teams: {response.status_code} - {response.text}")
             # Fallback to a simple text notification with the card's title, if available
+            if fallback_message:
+                return notify_teams(fallback_message)
             title = next((b.get("text") for b in card.get("body", []) if isinstance(b, dict) and b.get("type") == "TextBlock"), None)
             return notify_teams(title or "New notification (fallback)")
     except requests.RequestException as e:
@@ -262,69 +264,67 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
         "version": "1.4",
         "msteams": {"width": "Full"},
         "body": [
-            {
-                "type": "TextBlock",
-                "text": "Novo ticket recebido",
-                "wrap": True,
-                "weight": "Bolder",
-                "size": "Large",
-            },
-            {
-                "type": "TextBlock",
-                "text": ticket.title or "(Sem título)",
-                "wrap": True,
-                "size": "Medium",
-                "spacing": "Small",
-            },
-            {
-                "type": "FactSet",
-                "facts": facts,
-                "spacing": "Medium",
-            },
+            {"type": "TextBlock", "text": "🚨 Novo Chamado na Fila! 🚨", "wrap": True, "weight": "Bolder", "size": "Large"},
+            {"type": "TextBlock", "text": f"Contato: {ticket.contact or '(não informado)'}", "wrap": True, "spacing": "Small"},
         ],
         "actions": actions,
     }
 
-    if content_snippet:
+    # Empresa (se houver)
+    if getattr(ticket, "customer", None):
         card["body"].append({
             "type": "TextBlock",
-            "text": "Descrição:",
+            "text": f"Empresa: {ticket.customer} (se houver)",
             "wrap": True,
-            "weight": "Bolder",
-            "spacing": "Medium",
-        })
-        card["body"].append({
-            "type": "TextBlock",
-            "text": content_snippet,
-            "wrap": True,
-            "spacing": "Small",
         })
 
+    # Ticket line
+    card["body"].append({
+        "type": "TextBlock",
+        "text": f"Ticket: #{ticket.id}: {ticket.title or '(Sem título)'}",
+        "wrap": True,
+    })
+
+    # Link section
+    card["body"].append({
+        "type": "TextBlock",
+        "text": "\n👇 Clique para abrir o chamado:",
+        "wrap": True,
+        "spacing": "Medium",
+    })
+    if ticket_url:
+        # Use markdown link so it displays text and is clickable
+        card["body"].append({
+            "type": "TextBlock",
+            "text": f"[Link para o Chamado]({ticket_url})",
+            "wrap": True,
+        })
+    else:
+        card["body"].append({
+            "type": "TextBlock",
+            "text": "(link não disponível)",
+            "wrap": True,
+        })
+
+    # Mention-esque line (note: incoming webhooks don't create real mentions)
+    card["body"].append({
+        "type": "TextBlock",
+        "text": "\n@Time de Suporte, alguém pode assumir?",
+        "wrap": True,
+        "weight": "Bolder",
+        "spacing": "Medium",
+    })
+
+    # Keep AI details at the end as an optional section
+    if content_snippet:
+        card["body"].append({"type": "TextBlock", "text": "\nDescrição:", "wrap": True, "weight": "Bolder", "spacing": "Medium"})
+        card["body"].append({"type": "TextBlock", "text": content_snippet, "wrap": True, "spacing": "Small"})
+
     card["body"].extend([
-        {
-            "type": "TextBlock",
-            "text": "Resumo do Problema (IA):",
-            "wrap": True,
-            "weight": "Bolder",
-            "spacing": "Medium",
-        },
-        {
-            "type": "TextBlock",
-            "text": resumo,
-            "wrap": True,
-        },
-        {
-            "type": "TextBlock",
-            "text": "Sugestão de Solução (IA):",
-            "wrap": True,
-            "weight": "Bolder",
-            "spacing": "Medium",
-        },
-        {
-            "type": "TextBlock",
-            "text": sugestao,
-            "wrap": True,
-        },
+        {"type": "TextBlock", "text": "\nResumo do Problema (IA):", "wrap": True, "weight": "Bolder", "spacing": "Medium"},
+        {"type": "TextBlock", "text": resumo, "wrap": True},
+        {"type": "TextBlock", "text": "Sugestão de Solução (IA):", "wrap": True, "weight": "Bolder", "spacing": "Medium"},
+        {"type": "TextBlock", "text": sugestao, "wrap": True},
     ])
 
     return card
@@ -337,6 +337,27 @@ def build_ai_comment_html(ai_summary: Dict[str, str]) -> str:
         f"<b>Resumo do Problema (IA):</b><br>{resumo}<br><br>"
         f"<b>Sugestão de Solução (IA):</b><br>{solucao}"
     )
+
+
+def build_teams_text_message(ticket: Ticket) -> str:
+    contact = ticket.contact or "(não informado)"
+    customer = getattr(ticket, "customer", None)
+    url = build_ticket_url(ticket.id)
+    lines = [
+        "🚨 Novo Chamado na Fila! 🚨",
+        "",
+        f"Contato: {contact}",
+    ]
+    if customer:
+        lines.append(f"Empresa: {customer} (se houver)")
+    title = ticket.title or "(Sem título)"
+    lines.append(f"Ticket: #{ticket.id}: {title}")
+    lines.append("")
+    lines.append("👇 Clique para abrir o chamado:")
+    lines.append(url or "(link não disponível)")
+    lines.append("")
+    lines.append("@Time de Suporte, alguém pode assumir?")
+    return "\n".join(lines)
 
 
 def process_issue(agi_client: AgideskAPI, issue: Ticket) -> Optional[Dict[str, Any]]:
@@ -353,15 +374,23 @@ def process_issue(agi_client: AgideskAPI, issue: Ticket) -> Optional[Dict[str, A
     # First, get the AI summary to include in the card we post to Teams
     ai_summary = call_openai_simplified(issue)
 
-    # Build and send an Adaptive Card notification to Teams
+    # Build and send Teams notification (text template or Adaptive Card)
     try:
-        card = build_ticket_adaptive_card(issue, ai_summary)
-        if notify_teams_adaptive(card):
-            logging.info(f"✅ Adaptive Card for ticket {issue.id} sent to Teams")
+        style = os.getenv("TEAMS_MESSAGE_STYLE", "card").lower().strip()
+        fallback_text = build_teams_text_message(issue)
+        if style == "text":
+            if notify_teams(fallback_text):
+                logging.info(f"✅ Text message for ticket {issue.id} sent to Teams")
+            else:
+                logging.error(f"❌ Failed to send text message for ticket {issue.id} to Teams")
         else:
-            logging.error(f"❌ Failed to send Adaptive Card for ticket {issue.id} to Teams")
+            card = build_ticket_adaptive_card(issue, ai_summary)
+            if notify_teams_adaptive(card, fallback_message=fallback_text):
+                logging.info(f"✅ Adaptive Card for ticket {issue.id} sent to Teams")
+            else:
+                logging.error(f"❌ Failed to send Adaptive Card for ticket {issue.id} to Teams")
     except Exception as e:
-        logging.error(f"Error building/sending Adaptive Card for ticket {issue.id}: {e}")
+        logging.error(f"Error building/sending Teams message for ticket {issue.id}: {e}")
     
     update_resp: Dict[str, Any] = {"status": "skipped in development mode"}
     if MODE == "production" or issue.id == "3315": #TODO: remove testing hard code
