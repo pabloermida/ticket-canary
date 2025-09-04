@@ -1,8 +1,9 @@
 import os
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from textwrap import shorten
 
 import requests
@@ -104,12 +105,44 @@ def within_last_seconds(created_at: str, seconds: int = 300) -> bool:
 
 
 def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
+    """Call OpenAI to summarize the ticket. Includes images if present.
+
+    If the ticket contains HTML content with <img src="..."> tags, extract the
+    image URLs and pass them to the model alongside the text using multi-part
+    message content. Falls back to text-only if no images are found.
+    """
+
+    def extract_image_urls(html_content: Optional[str]) -> List[str]:
+        if not html_content:
+            return []
+        # Match src="..." or src='...' within <img ...> tags
+        urls: List[str] = []
+        try:
+            urls.extend(re.findall(r"<img[^>]+src=\"([^\"]+)\"", html_content, flags=re.IGNORECASE))
+            urls.extend(re.findall(r"<img[^>]+src='([^']+)'", html_content, flags=re.IGNORECASE))
+        except re.error:
+            pass
+        # Keep http(s) only to avoid data URIs or unsupported schemes
+        return [u for u in urls if u.startswith("http://") or u.startswith("https://")]
+
     system_text = (
         "Você é um engenheiro de suporte técnico especialista. Com base nas informações do ticket, "
         "forneça um objeto JSON com duas chaves: 'resumo_problema' (um resumo curto e claro "
         "do problema do usuário) e 'sugestao_solucao' (uma possível solução ou passos para resolvê-lo)."
     )
     user_text = f"Título: {ticket.title}\nConteúdo: {ticket.content}"
+    image_urls = extract_image_urls(getattr(ticket, "htmlcontent", None))
+
+    # Build multi-part user content if images are available
+    user_content: Any
+    if image_urls:
+        parts: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
+        for url in image_urls:
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+        user_content = parts
+    else:
+        user_content = user_text
+
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -117,8 +150,10 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_text},
-            {"role": "user", "content": user_text},
+            {"role": "user", "content": user_content},
         ],
+        # Ensure we have some room for JSON output
+        "max_tokens": 1000,
     }
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=120)
@@ -432,8 +467,9 @@ def main(timer: func.TimerRequest) -> None:
         processed_ids = load_processed_ids()
         issues = agi.search_tickets(
             forecast='inbox',
-            period='today',#TODO change to 'last_5_minutes' after testing
+            period='today', # TODO change to 'last_5_minutes' after testing
             per_page=100,
+            fields='id,title,content,htmlcontent,created_at,lists',
         )
         logging.info(f"Found {len(issues)} tickets.")
 

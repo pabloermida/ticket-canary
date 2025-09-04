@@ -48,7 +48,7 @@ export TEAMS_MESSAGE_STYLE="card"
 
 Por padrão, `python3 main.py` executa um modo de teste local que busca e processa tickets específicos por ID (ignorando filtros de data) e imprime a resposta da IA para cada um.
 
-IDs padrão: `["3012", "2321", "2207", "3342"]`
+IDs padrão: `["3012", "2321", "2207", "3342, 3505"]`
 
 ```bash
 python3 main.py
@@ -136,6 +136,13 @@ Observações
 - As variáveis podem ser definidas via `export` (tomam precedência) ou via `local.settings.json` (o `main.py` lê automaticamente).
 - Notificações do Teams usam Adaptive Cards via Incoming Webhook. Se o post do card falhar, há fallback para mensagem de texto simples.
 - O link do card pode ser customizado via `AGIDESK_TICKET_URL_TEMPLATE`.
+
+## Análise de Imagens (IA)
+
+- Quando o ticket contém imagens no HTML (`htmlcontent` com tags `<img src="...">`), o sistema extrai as URLs e as envia junto com o texto para a OpenAI.
+- Funciona tanto no modo local por IDs (`python3 main.py`) quanto no pipeline com timer (`RUN_TIMER=1 python3 main.py`).
+- Somente links `http(s)` são considerados. Se a URL for privada/expirada, a análise da imagem pode não ocorrer.
+- A busca do timer já inclui `fields='id,title,content,htmlcontent,created_at,lists'` para garantir que `htmlcontent` chegue na análise.
 
 ## Template de mensagem do Teams
 
