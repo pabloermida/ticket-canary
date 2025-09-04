@@ -37,6 +37,11 @@ export AzureWebJobsStorage="UseDevelopmentStorage=true"
 
 # (Opcional) Customiza o link do card para abrir o ticket diretamente
 export AGIDESK_TICKET_URL_TEMPLATE="https://cliente.infiniit.com.br/br/painel/atendimento/{id}"
+
+# (Opcional) Enviar mensagens ao Teams no modo de teste por IDs
+# Define estilo do Teams: "card" (padrão) ou "text"
+export LOCAL_TEST_SEND_TEAMS=0
+export TEAMS_MESSAGE_STYLE="card"
 ```
 
 3) Rodar localmente (modo de teste por IDs)
@@ -74,6 +79,7 @@ Observações do modo de teste
 - Ignora janelas/períodos de busca; usa `get_issue` por ID.
 - Não grava estado em Blob e não exige Azurite.
 - Por padrão é somente leitura: imprime o resumo/sugestão da IA e não envia ao Teams nem escreve comentários no Agidesk.
+- Opcional: defina `LOCAL_TEST_SEND_TEAMS=1` para enviar notificações ao Teams durante o teste local (requer `TEAMS_WEBHOOK_URL`). Use `TEAMS_MESSAGE_STYLE=text` para mensagem simples ou deixe `card` para Adaptive Card.
 
 3.1) Incluir comentários no Agidesk (opcional, via flag)
 
@@ -98,6 +104,25 @@ Com `LOCAL_TEST_WRITE_COMMENTS=1` ativo (ou `MODE=production`), o script irá:
 Observações de segurança
 - Esse modo faz escrita real no Agidesk. Use em um ambiente/tenant de testes ou com IDs de tickets de teste.
 - Caso não queira escrever comentários, deixe `LOCAL_TEST_WRITE_COMMENTS` desativado (padrão) e/ou `MODE=development`.
+
+3.2) Enviar mensagens ao Teams (opcional, independente do comentário)
+
+Para enviar notificações ao Teams no modo de teste por IDs, ative `LOCAL_TEST_SEND_TEAMS=1`. Isso não exige habilitar escrita de comentários.
+
+Exemplo (apenas Teams, sem comentários):
+
+```bash
+export TEAMS_WEBHOOK_URL="https://...incomingwebhook..."
+export AGIDESK_ACCOUNT_ID="infiniit"
+export AGIDESK_APP_KEY="SEU_TOKEN"
+export LOCAL_TEST_TICKET_IDS='3012,2321,2207,3342'
+export LOCAL_TEST_SEND_TEAMS=1
+# opcional: forçar texto simples ao invés de card
+# export TEAMS_MESSAGE_STYLE=text
+python3 main.py
+```
+
+Para enviar Teams e também comentar no Agidesk, combine com `LOCAL_TEST_WRITE_COMMENTS=1` (ou `MODE=production`).
 
 4) Rodar o pipeline completo (timer) localmente
 

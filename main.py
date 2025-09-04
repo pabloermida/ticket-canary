@@ -60,7 +60,14 @@ def run_local_test_by_ids():
     `LOCAL_TEST_WRITE_COMMENTS=1` (or MODE=production).
     """
     from agidesk import AgideskAPI
-    from ticket_canary_function.__init__ import call_openai_simplified, build_ai_comment_html
+    from ticket_canary_function.__init__ import (
+        call_openai_simplified,
+        build_ai_comment_html,
+        notify_teams,
+        notify_teams_adaptive,
+        build_ticket_adaptive_card,
+        build_teams_text_message,
+    )
 
     account_id = os.getenv("AGIDESK_ACCOUNT_ID")
     app_key = os.getenv("AGIDESK_APP_KEY")
@@ -74,10 +81,18 @@ def run_local_test_by_ids():
     agi = AgideskAPI(account_id=account_id, app_key=app_key)
 
     allow_write = (os.getenv("MODE", "development").strip().lower() == "production") or _is_truthy_env("LOCAL_TEST_WRITE_COMMENTS")
+    send_teams = _is_truthy_env("LOCAL_TEST_SEND_TEAMS")
+    style = os.getenv("TEAMS_MESSAGE_STYLE", "card").strip().lower()
     if allow_write:
         logging.info("Local test is configured to WRITE comments to Agidesk.")
     else:
         logging.info("Local test is in READ-ONLY mode (no Agidesk comments). Set LOCAL_TEST_WRITE_COMMENTS=1 to enable writing.")
+    if send_teams:
+        logging.info(
+            f"Local test will SEND Teams notifications (style='{style}'). Set TEAMS_MESSAGE_STYLE=text to use plain text."
+        )
+    else:
+        logging.info("Local test will NOT send Teams notifications. Set LOCAL_TEST_SEND_TEAMS=1 to enable.")
 
     for tid in ids:
         try:
@@ -92,6 +107,24 @@ def run_local_test_by_ids():
                 "title": issue.title,
                 "ai_summary": ai_summary,
             }, ensure_ascii=False, indent=2))
+            if send_teams:
+                try:
+                    fallback_text = build_teams_text_message(issue)
+                    if style == "text":
+                        ok = notify_teams(fallback_text)
+                        if ok:
+                            logging.info(f"Teams text message sent for ticket {issue.id}.")
+                        else:
+                            logging.error(f"Failed to send Teams text message for ticket {issue.id}.")
+                    else:
+                        card = build_ticket_adaptive_card(issue, ai_summary)
+                        ok = notify_teams_adaptive(card, fallback_message=fallback_text)
+                        if ok:
+                            logging.info(f"Teams Adaptive Card sent for ticket {issue.id}.")
+                        else:
+                            logging.error(f"Failed to send Teams Adaptive Card for ticket {issue.id}.")
+                except Exception as e:
+                    logging.error(f"Error sending Teams notification for ticket {issue.id}: {e}")
             if allow_write:
                 try:
                     html = build_ai_comment_html(ai_summary)
