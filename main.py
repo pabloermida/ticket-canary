@@ -48,10 +48,19 @@ def parse_ids_from_env() -> List[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+def _is_truthy_env(name: str) -> bool:
+    v = os.getenv(name, "").strip().lower()
+    return v in {"1", "true", "yes", "on"}
+
+
 def run_local_test_by_ids():
-    """Fetch specific tickets by ID and print AI responses (no date filtering)."""
+    """Fetch specific tickets by ID and print AI responses.
+
+    Optionally, add the AI summary as a comment in Agidesk when
+    `LOCAL_TEST_WRITE_COMMENTS=1` (or MODE=production).
+    """
     from agidesk import AgideskAPI
-    from ticket_canary_function.__init__ import call_openai_simplified
+    from ticket_canary_function.__init__ import call_openai_simplified, build_ai_comment_html
 
     account_id = os.getenv("AGIDESK_ACCOUNT_ID")
     app_key = os.getenv("AGIDESK_APP_KEY")
@@ -63,6 +72,12 @@ def run_local_test_by_ids():
     logging.info(f"Running local test for ticket IDs: {ids}")
 
     agi = AgideskAPI(account_id=account_id, app_key=app_key)
+
+    allow_write = (os.getenv("MODE", "development").strip().lower() == "production") or _is_truthy_env("LOCAL_TEST_WRITE_COMMENTS")
+    if allow_write:
+        logging.info("Local test is configured to WRITE comments to Agidesk.")
+    else:
+        logging.info("Local test is in READ-ONLY mode (no Agidesk comments). Set LOCAL_TEST_WRITE_COMMENTS=1 to enable writing.")
 
     for tid in ids:
         try:
@@ -77,6 +92,15 @@ def run_local_test_by_ids():
                 "title": issue.title,
                 "ai_summary": ai_summary,
             }, ensure_ascii=False, indent=2))
+            if allow_write:
+                try:
+                    html = build_ai_comment_html(ai_summary)
+                    resp = agi.add_comment(issue.id, html)
+                    logging.info(f"Comment posted to Agidesk for ticket {issue.id}.")
+                    if resp:
+                        logging.debug(json.dumps(resp, ensure_ascii=False))
+                except Exception as e:
+                    logging.error(f"Failed to post comment for ticket {issue.id}: {e}")
         except Exception as e:
             logging.error(f"Error processing ticket {tid}: {e}")
 

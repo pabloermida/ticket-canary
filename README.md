@@ -73,7 +73,31 @@ Saída esperada (exemplo simplificado por ticket):
 Observações do modo de teste
 - Ignora janelas/períodos de busca; usa `get_issue` por ID.
 - Não grava estado em Blob e não exige Azurite.
-- Apenas imprime o resumo/sugestão da IA por ticket. Não envia cartões ao Teams e não escreve comentários no Agidesk.
+- Por padrão é somente leitura: imprime o resumo/sugestão da IA e não envia ao Teams nem escreve comentários no Agidesk.
+
+3.1) Incluir comentários no Agidesk (opcional, via flag)
+
+Para testar localmente a inclusão de comentários no Agidesk para os IDs fornecidos, habilite explicitamente a escrita com a variável `LOCAL_TEST_WRITE_COMMENTS=1` (ou execute com `MODE=production`).
+
+Exemplo:
+
+```bash
+export AGIDESK_ACCOUNT_ID="infiniit"
+export AGIDESK_APP_KEY="SEU_TOKEN"
+export OPENAI_API_KEY="sk-..."              # opcional, mas recomendado
+export LOCAL_TEST_TICKET_IDS='3012,2321,2207,3342'  # seus IDs de teste
+export LOCAL_TEST_WRITE_COMMENTS=1           # habilita escrita de comentários
+python3 main.py
+```
+
+Com `LOCAL_TEST_WRITE_COMMENTS=1` ativo (ou `MODE=production`), o script irá:
+- Buscar cada ticket por ID;
+- Gerar o resumo/sugestão da IA;
+- Adicionar um comentário no Agidesk com o conteúdo da IA (HTML simples).
+
+Observações de segurança
+- Esse modo faz escrita real no Agidesk. Use em um ambiente/tenant de testes ou com IDs de tickets de teste.
+- Caso não queira escrever comentários, deixe `LOCAL_TEST_WRITE_COMMENTS` desativado (padrão) e/ou `MODE=development`.
 
 4) Rodar o pipeline completo (timer) localmente
 
