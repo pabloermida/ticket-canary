@@ -126,9 +126,17 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
         return [u for u in urls if u.startswith("http://") or u.startswith("https://")]
 
     system_text = (
-        "Você é um engenheiro de suporte técnico especialista. Com base nas informações do ticket, "
-        "forneça um objeto JSON com duas chaves: 'resumo_problema' (um resumo curto e claro "
-        "do problema do usuário) e 'sugestao_solucao' (uma possível solução ou passos para resolvê-lo)."
+        "Você é um Analista de Suporte N2 dos clientes da Infraestrutura da Infiniit (infiniit.com.br). "
+        "Leia atentamente os dados do ticket e responda SOMENTE com um objeto JSON contendo EXACTAMENTE "
+        "as chaves: 'resumo_problema' e 'sugestao_solucao' (ambas strings). "
+        "Regras e escopo: "
+        "1) Foque em análise de infraestrutura (redes, Windows/Linux Server, virtualização/VMware, backup/Veeam, firewalls, Azure/M365, monitoramento e segurança). "
+        "2) Forneça diagnóstico e próxima ação acionável em nível N2: hipóteses, comandos/verificações, logs a coletar, e validações passo a passo. "
+        "3) Quando pertinente, faça referência a recursos públicos abertos (nome do recurso e URL de documentação oficial, KBs de fornecedor, CVEs, guias). NÃO invente fontes; se não puder confirmar um link específico, cite apenas o nome do recurso e marque como sugestivo. "
+        "4) Se houver imagens, considere-as como evidência auxiliar. "
+        "5) Não exponha dados sensíveis além do que foi fornecido; mantenha linguagem objetiva e profissional em PT-BR. "
+        "6) Se o conteúdo for incompatível com análise de infraestrutura (ex.: assunto comercial, financeiro, sem dados técnicos, ou não relacionado a TI), retorne 'resumo_problema' como string vazia e 'sugestao_solucao' com a frase: 'Entrada incompatível com análise de infraestrutura.'. "
+        "7) Saída estritamente em JSON válido, sem texto extra, sem comentários, sem campos adicionais."
     )
     user_text = f"Título: {ticket.title}\nConteúdo: {ticket.content}"
     image_urls = extract_image_urls(getattr(ticket, "htmlcontent", None))
@@ -147,6 +155,7 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": OPENAI_MODEL,
+        #"reasoning":{"effort": "high"},
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_text},
@@ -299,7 +308,7 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
         "version": "1.4",
         "msteams": {"width": "Full"},
         "body": [
-            {"type": "TextBlock", "text": "🚨 Novo Chamado na Fila! 🚨", "wrap": True, "weight": "Bolder", "size": "Large"},
+            {"type": "TextBlock", "text": "🚨 Novo Chamado! 🚨", "wrap": True, "weight": "Bolder", "size": "Large"},
             {"type": "TextBlock", "text": f"Contato: {ticket.contact or '(não informado)'}", "wrap": True, "spacing": "Small"},
         ],
         "actions": actions,
@@ -309,8 +318,9 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
     if getattr(ticket, "customer", None):
         card["body"].append({
             "type": "TextBlock",
-            "text": f"Empresa: {ticket.customer} (se houver)",
+            "text": f"Empresa: {ticket.customer}",
             "wrap": True,
+            "weight": "Bolder",
         })
 
     # Ticket line
@@ -318,6 +328,7 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
         "type": "TextBlock",
         "text": f"Ticket: #{ticket.id}: {ticket.title or '(Sem título)'}",
         "wrap": True,
+        "weight": "Bolder",
     })
 
     # Link section (now encourages using the button instead of inline link)
@@ -344,16 +355,16 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
     })
 
     # Keep AI details at the end as an optional section
-    if content_snippet:
-        card["body"].append({"type": "TextBlock", "text": "\nDescrição:", "wrap": True, "weight": "Bolder", "spacing": "Medium"})
-        card["body"].append({"type": "TextBlock", "text": content_snippet, "wrap": True, "spacing": "Small"})
+    # if content_snippet:
+    #     card["body"].append({"type": "TextBlock", "text": "\nDescrição:", "wrap": True, "weight": "Bolder", "spacing": "Medium"})
+    #     card["body"].append({"type": "TextBlock", "text": content_snippet, "wrap": True, "spacing": "Small"})
 
-    card["body"].extend([
-        {"type": "TextBlock", "text": "\nResumo do Problema (IA):", "wrap": True, "weight": "Bolder", "spacing": "Medium"},
-        {"type": "TextBlock", "text": resumo, "wrap": True},
-        {"type": "TextBlock", "text": "Sugestão de Solução (IA):", "wrap": True, "weight": "Bolder", "spacing": "Medium"},
-        {"type": "TextBlock", "text": sugestao, "wrap": True},
-    ])
+    # card["body"].extend([
+    #     {"type": "TextBlock", "text": "\nResumo do Problema (IA):", "wrap": True, "weight": "Bolder", "spacing": "Medium"},
+    #     {"type": "TextBlock", "text": resumo, "wrap": True},
+    #     {"type": "TextBlock", "text": "Sugestão de Solução (IA):", "wrap": True, "weight": "Bolder", "spacing": "Medium"},
+    #     {"type": "TextBlock", "text": sugestao, "wrap": True},
+    # ])
 
     return card
 
@@ -384,7 +395,6 @@ def build_teams_text_message(ticket: Ticket) -> str:
     lines.append("👇 Clique para abrir o chamado:")
     lines.append(url or "(link não disponível)")
     lines.append("")
-    lines.append("@Time de Suporte, alguém pode assumir?")
     return "\n".join(lines)
 
 
@@ -421,7 +431,7 @@ def process_issue(agi_client: AgideskAPI, issue: Ticket) -> Optional[Dict[str, A
         logging.error(f"Error building/sending Teams message for ticket {issue.id}: {e}")
     
     update_resp: Dict[str, Any] = {"status": "skipped in development mode"}
-    if MODE == "production" or issue.id == "3315": #TODO: remove testing hard code
+    if MODE == "production":
         comment_html = build_ai_comment_html(ai_summary)
         try:
             update_resp = agi_client.add_comment(issue.id, comment_html)
@@ -430,8 +440,8 @@ def process_issue(agi_client: AgideskAPI, issue: Ticket) -> Optional[Dict[str, A
             update_resp = {"error": str(e)}
             logging.error(f"Failed to add comment to ticket {issue.id} in Agidesk: {e}")
     else:
-        logging.info(f"Skipping update for ticket {issue.id} (not the test ticket 3315).")
-        update_resp = {"status": "skipped, not test ticket"}
+        logging.info(f"Skipping Agidesk update for ticket {issue.id} (non-production mode).")
+        update_resp = {"status": "skipped, non-production mode"}
 
     return {
         "issue_id": issue.id,
@@ -460,9 +470,11 @@ def main(timer: func.TimerRequest) -> None:
         processed_ids = load_processed_ids()
         issues = agi.search_tickets(
             forecast='inbox',
-            period='today', # TODO change to 'last_5_minutes' after testing
+            periodfield='created_at',
+            initialdate=ds_time(now_utc() - timedelta(minutes=5)),
+            finaldate=ds_time(now_utc()),
             per_page=100,
-            fields='id,title,content,htmlcontent,created_at,lists',
+            fields='id,title,content,htmlcontent,created_at,lists,customer,contact',
         )
         logging.info(f"Found {len(issues)} tickets.")
 
