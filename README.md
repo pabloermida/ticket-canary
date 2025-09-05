@@ -20,6 +20,7 @@ export AGIDESK_APP_KEY="SEU_TOKEN"              # API Key do Agidesk
 export TEAMS_WEBHOOK_URL="https://...incomingwebhook..."  # Webhook do Teams
 
 # OpenAI (usado para resumo/sugestão no card do Teams)
+# Agora usando a Responses API (\`/v1/responses\`) com \`response_format: json_object\`.
 export OPENAI_API_KEY="sk-..."
 export OPENAI_MODEL="gpt-4.1-mini"
 
