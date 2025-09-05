@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import re
+import html
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 from textwrap import shorten
@@ -155,7 +156,6 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": OPENAI_MODEL,
-        #"reasoning":{"effort": "high"},
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_text},
@@ -289,8 +289,34 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
         # Trim content to keep the card tidy
         content_snippet = shorten(ticket.content.strip(), width=500, placeholder="…")
 
-    resumo = ai_summary.get("resumo_problema") or "N/A"
-    sugestao = ai_summary.get("sugestao_solucao") or "N/A"
+    # Be resilient to slight key variations from the model
+    def _get_first(d: Dict[str, Any], keys: list[str], default: str = "N/A") -> str:
+        for k in keys:
+            if k in d and d[k]:
+                v = d[k]
+                # Normalize non-string payloads
+                if isinstance(v, list):
+                    if all(isinstance(x, str) for x in v):
+                        return "\n".join(f"- {x}" for x in v)
+                    return json.dumps(v, ensure_ascii=False)
+                if isinstance(v, dict):
+                    return json.dumps(v, ensure_ascii=False)
+                return str(v)
+        return default
+
+    resumo = _get_first(ai_summary, [
+        "resumo_problema",
+        "resumo",
+        "resumo_do_problema",
+        "resumoProblema",
+    ])
+    sugestao = _get_first(ai_summary, [
+        "sugestao_solucao",
+        "sugestao",
+        "sugestao_de_solucao",
+        "sugestaoDeSolucao",
+        "solucao_sugerida",
+    ])
 
     # Build actions
     actions = []
@@ -309,16 +335,16 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
         "msteams": {"width": "Full"},
         "body": [
             {"type": "TextBlock", "text": "🚨 Novo Chamado! 🚨", "wrap": True, "weight": "Bolder", "size": "Large"},
-            {"type": "TextBlock", "text": f"Contato: {ticket.contact or '(não informado)'}", "wrap": True, "spacing": "Small"},
+            {"type": "TextBlock", "text": f"**Contato**: {ticket.contact or '(não informado)'}", "wrap": True, "spacing": "Small"},
         ],
         "actions": actions,
     }
 
     # Empresa (se houver)
-    if getattr(ticket, "customer", None):
+    if getattr(ticket, "customer", None):#TODO: make only the ""Empresa"" part bold
         card["body"].append({
             "type": "TextBlock",
-            "text": f"Empresa: {ticket.customer}",
+            "text": f"**Empresa**: {ticket.customer}",
             "wrap": True,
             "weight": "Bolder",
         })
@@ -326,18 +352,18 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
     # Ticket line
     card["body"].append({
         "type": "TextBlock",
-        "text": f"Ticket: #{ticket.id}: {ticket.title or '(Sem título)'}",
+        "text": f"**Ticket**: #{ticket.id}: {ticket.title or '(Sem título)'}",
         "wrap": True,
         "weight": "Bolder",
     })
 
     # Link section (now encourages using the button instead of inline link)
-    card["body"].append({
-        "type": "TextBlock",
-        "text": "\n👇 Clique no botão abaixo para abrir o chamado:",
-        "wrap": True,
-        "spacing": "Medium",
-    })
+    # card["body"].append({
+    #     "type": "TextBlock",
+    #     "text": "\n👇 Clique no botão abaixo para abrir o chamado:",
+    #     "wrap": True,
+    #     "spacing": "Medium",
+    # })
     if not ticket_url:
         card["body"].append({
             "type": "TextBlock",
@@ -346,13 +372,13 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
         })
 
     # Mention-esque line (note: incoming webhooks don't create real mentions)
-    card["body"].append({
-        "type": "TextBlock",
-        "text": "\n@Time de Suporte, alguém pode assumir?",
-        "wrap": True,
-        "weight": "Bolder",
-        "spacing": "Medium",
-    })
+    # card["body"].append({
+    #     "type": "TextBlock",
+    #     "text": "\n@Time de Suporte, alguém pode assumir?",
+    #     "wrap": True,
+    #     "weight": "Bolder",
+    #     "spacing": "Medium",
+    # })
 
     # Keep AI details at the end as an optional section
     # if content_snippet:
@@ -370,11 +396,76 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
 
 
 def build_ai_comment_html(ai_summary: Dict[str, str]) -> str:
-    resumo = ai_summary.get('resumo_problema', 'N/A')
-    solucao = ai_summary.get('sugestao_solucao', 'N/A')
+    """Format AI summary into HTML with pretty lists if present.
+
+    Detects simple unordered ("-", "*", "•") and ordered ("1.", "1)") lists
+    line-by-line and renders them as <ul>/<ol>. Falls back to paragraphs.
+    """
+
+    def render_block(text: str) -> str:
+        text = (text or "").strip()
+        if not text:
+            return "<p>N/A</p>"
+
+        lines = [ln.strip() for ln in text.splitlines()]
+        parts: list[str] = []
+        i = 0
+        while i < len(lines):
+            ln = lines[i]
+            if not ln:
+                i += 1
+                continue
+
+            mo_num = re.match(r"^(\d+)[\.)]\s+(.*)$", ln)
+            mo_bul = re.match(r"^(?:[-*•–—])\s+(.*)$", ln)
+            if mo_num or mo_bul:
+                ordered = bool(mo_num)
+                tag = "ol" if ordered else "ul"
+                parts.append(f"<{tag}>")
+                while i < len(lines):
+                    cur = lines[i]
+                    if not cur:
+                        break
+                    mo_num2 = re.match(r"^(\d+)[\.)]\s+(.*)$", cur)
+                    mo_bul2 = re.match(r"^(?:[-*•–—])\s+(.*)$", cur)
+                    if (ordered and mo_num2) or ((not ordered) and mo_bul2):
+                        content = mo_num2.group(2) if mo_num2 else mo_bul2.group(1)
+                        parts.append(f"<li>{html.escape(content)}</li>")
+                        i += 1
+                        continue
+                    break
+                parts.append(f"</{tag}>")
+                continue
+
+            parts.append(f"<p>{html.escape(ln)}</p>")
+            i += 1
+
+        return "".join(parts)
+
+    # Resilient lookup for both fields to avoid 'N/A' when keys vary
+    def pick(d: Dict[str, Any], keys: list[str]) -> str:
+        for k in keys:
+            v = d.get(k)
+            if v is None:
+                continue
+            if isinstance(v, list):
+                if all(isinstance(x, str) for x in v):
+                    return "\n".join(f"- {x}" for x in v).strip()
+                return json.dumps(v, ensure_ascii=False)
+            if isinstance(v, dict):
+                return json.dumps(v, ensure_ascii=False)
+            return str(v).strip()
+        return ""
+
+    resumo = pick(ai_summary, ["resumo_problema", "resumo", "resumo_do_problema", "resumoProblema"]) or ""
+    solucao = pick(ai_summary, ["sugestao_solucao", "sugestao", "sugestao_de_solucao", "sugestaoDeSolucao", "solucao_sugerida"]) or ""
+
+    resumo_html = render_block(resumo)
+    solucao_html = render_block(solucao)
+
     return (
-        f"<b>Resumo do Problema (IA):</b><br>{resumo}<br><br>"
-        f"<b>Sugestão de Solução (IA):</b><br>{solucao}"
+        f"<b>Resumo do Problema:</b><br>{resumo_html}<br><br>"
+        f"<b>Sugestão:</b><br>{solucao_html}"
     )
 
 
@@ -474,9 +565,15 @@ def main(timer: func.TimerRequest) -> None:
             initialdate=ds_time(now_utc() - timedelta(minutes=5)),
             finaldate=ds_time(now_utc()),
             per_page=100,
-            fields='id,title,content,htmlcontent,created_at,lists,customer,contact',
+            fields='id,title,content,htmlcontent,created_at,lists,customer,customers,contact,contacts,fullcustomer,fullcontact',
         )
         logging.info(f"Found {len(issues)} tickets.")
+        if MODE == "development":
+            try:
+                issues_json = [issue.model_dump(exclude_none=True) for issue in issues]
+                logging.info("Search tickets result (JSON): " + json.dumps(issues_json, ensure_ascii=False))
+            except Exception as e:
+                logging.warning(f"Failed to serialize issues to JSON for logging: {e}")
 
         new_tickets = [issue for issue in issues if str(issue.id) not in processed_ids]
         logging.info(f"Found {len(new_tickets)} new tickets to process.")
