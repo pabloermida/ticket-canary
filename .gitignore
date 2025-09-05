@@ -1,3 +1,5 @@
 .env
 api_responses.log
 processed_ids.json
+__pycache__/
+*.py[cod]
