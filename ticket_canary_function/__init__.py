@@ -128,8 +128,9 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
 
     system_text = (
         "Você é um Analista de Suporte N2 dos clientes da Infraestrutura da Infiniit (infiniit.com.br). "
-        "Leia atentamente os dados do ticket e responda SOMENTE com um objeto JSON contendo EXACTAMENTE "
-        "as chaves: 'resumo_problema' e 'sugestao_solucao' (ambas strings). "
+        "Leia atentamente os dados do ticket e responda SOMENTE com um objeto JSON contendo: "
+        "'resumo_problema' (string) e 'sugestao_solucao' (string). Quando a sugestão contiver itens em lista/etapas, também preencha "
+        "'sugestao_solucao_lista' (array de strings para lista não ordenada) e/ou 'sugestao_solucao_lista_ordenada' (array de strings para passos numerados). "
         "Regras e escopo: "
         "1) Foque em análise de infraestrutura (redes, Windows/Linux Server, virtualização/VMware, backup/Veeam, firewalls, Azure/M365, monitoramento e segurança). "
         "2) Forneça diagnóstico e próxima ação acionável em nível N2: hipóteses, comandos/verificações, logs a coletar, e validações passo a passo. "
@@ -154,28 +155,67 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
 
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": OPENAI_MODEL,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": user_content},
-        ],
-        # Ensure we have some room for JSON output
-        "max_tokens": 1000,
-    }
-    try:
+
+    def _openai_debug() -> bool:
+        v = os.getenv("OPENAI_DEBUG", "").strip().lower()
+        return v in {"1", "true", "yes", "on"}
+
+    def make_payload(response_format: Dict[str, Any], content: Any) -> Dict[str, Any]:
+        return {
+            "model": OPENAI_MODEL,
+            "response_format": response_format,
+            "messages": [
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": content},
+            ],
+            "temperature": 0,
+            # Ensure we have some room for JSON output
+            "max_tokens": 1000,
+        }
+
+    def parse_response(resp_json: Dict[str, Any]) -> Dict[str, Any]:
+        content = resp_json.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        return json.loads(content)
+
+    response_format_object = {"type": "json_object"}
+
+    def post_and_parse(payload: Dict[str, Any]) -> Dict[str, Any]:
         r = requests.post(url, headers=headers, json=payload, timeout=120)
+        if r.status_code >= 400 and _openai_debug():
+            try:
+                logging.error(f"OpenAI error body: {r.text}")
+            except Exception:
+                pass
         r.raise_for_status()
-        data = r.json()
-        response_content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-        ai_summary = json.loads(response_content)
-        logging.info(f"AI response for ticket {ticket.id}: {ai_summary}")
+        return parse_response(r.json())
+
+    try:
+        # Attempt: json_object with user_content (may include images)
+        payload = make_payload(response_format_object, user_content)
+        ai_summary = post_and_parse(payload)
+        if _openai_debug():
+            logging.debug(f"AI response for ticket {ticket.id}: {ai_summary}")
         return ai_summary
-    except requests.RequestException as e:
+    except requests.HTTPError as e1:
+        # If images not supported or content must be string, retry as text-only
+        err_txt = getattr(getattr(e1, 'response', None), 'text', '') or str(e1)
+        if _openai_debug():
+            logging.debug(f"OpenAI HTTPError on first attempt: {err_txt}")
+
+        text_only = user_text
+        if image_urls:
+            text_only += "\n\nImagens (URLs):\n" + "\n".join(image_urls)
+
+        try:
+            payload2 = make_payload(response_format_object, text_only)
+            ai_summary = post_and_parse(payload2)
+            if _openai_debug():
+                logging.debug(f"AI response (json_object, text-only) for ticket {ticket.id}: {ai_summary}")
+            return ai_summary
+        except Exception as e2:
+            logging.error(f"Error calling OpenAI API after fallback: {e2}")
+    except Exception as e:
         logging.error(f"Error calling OpenAI API: {e}")
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logging.error(f"Failed to parse OpenAI response: {e}")
     return {"resumo_problema": "Error: Could not process AI response.", "sugestao_solucao": "N/A"}
 
 
@@ -395,78 +435,65 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
     return card
 
 
-def build_ai_comment_html(ai_summary: Dict[str, str]) -> str:
-    """Format AI summary into HTML with pretty lists if present.
+def build_ai_comment_html(ai_summary: Dict[str, Any]) -> str:
+    """Build Agidesk comment HTML from structured AI response.
 
-    Detects simple unordered ("-", "*", "•") and ordered ("1.", "1)") lists
-    line-by-line and renders them as <ul>/<ol>. Falls back to paragraphs.
+    Uses the AI's structured fields for lists when present, avoiding heuristic
+    parsing. Supports optional arrays:
+    - 'sugestao_solucao_lista' (unordered)
+    - 'sugestao_solucao_lista_ordenada' (ordered)
+    and the main strings:
+    - 'resumo_problema'
+    - 'sugestao_solucao'
     """
 
-    def render_block(text: str) -> str:
-        text = (text or "").strip()
-        if not text:
-            return "<p>N/A</p>"
+    def esc(s: Any) -> str:
+        return html.escape(str(s)) if s is not None else ""
 
-        lines = [ln.strip() for ln in text.splitlines()]
-        parts: list[str] = []
-        i = 0
-        while i < len(lines):
-            ln = lines[i]
-            if not ln:
-                i += 1
-                continue
+    resumo_text = ""
+    for k in ("resumo_problema", "resumo", "resumo_do_problema", "resumoProblema"):
+        if ai_summary.get(k):
+            resumo_text = str(ai_summary[k])
+            break
 
-            mo_num = re.match(r"^(\d+)[\.)]\s+(.*)$", ln)
-            mo_bul = re.match(r"^(?:[-*•–—])\s+(.*)$", ln)
-            if mo_num or mo_bul:
-                ordered = bool(mo_num)
-                tag = "ol" if ordered else "ul"
-                parts.append(f"<{tag}>")
-                while i < len(lines):
-                    cur = lines[i]
-                    if not cur:
-                        break
-                    mo_num2 = re.match(r"^(\d+)[\.)]\s+(.*)$", cur)
-                    mo_bul2 = re.match(r"^(?:[-*•–—])\s+(.*)$", cur)
-                    if (ordered and mo_num2) or ((not ordered) and mo_bul2):
-                        content = mo_num2.group(2) if mo_num2 else mo_bul2.group(1)
-                        parts.append(f"<li>{html.escape(content)}</li>")
-                        i += 1
-                        continue
-                    break
-                parts.append(f"</{tag}>")
-                continue
+    solucao_text = ""
+    for k in ("sugestao_solucao", "sugestao", "sugestao_de_solucao", "sugestaoDeSolucao", "solucao_sugerida"):
+        if ai_summary.get(k):
+            solucao_text = str(ai_summary[k])
+            break
 
-            parts.append(f"<p>{html.escape(ln)}</p>")
-            i += 1
+    ul_items = ai_summary.get("sugestao_solucao_lista")
+    ol_items = ai_summary.get("sugestao_solucao_lista_ordenada")
 
-        return "".join(parts)
+    def _clean_ol_item(s: Any) -> str:
+        txt = str(s) if s is not None else ""
+        try:
+            return re.sub(r"^\s*\d+[\.)]?\s*", "", txt)
+        except re.error:
+            return txt
 
-    # Resilient lookup for both fields to avoid 'N/A' when keys vary
-    def pick(d: Dict[str, Any], keys: list[str]) -> str:
-        for k in keys:
-            v = d.get(k)
-            if v is None:
-                continue
-            if isinstance(v, list):
-                if all(isinstance(x, str) for x in v):
-                    return "\n".join(f"- {x}" for x in v).strip()
-                return json.dumps(v, ensure_ascii=False)
-            if isinstance(v, dict):
-                return json.dumps(v, ensure_ascii=False)
-            return str(v).strip()
-        return ""
+    def _clean_ul_item(s: Any) -> str:
+        txt = str(s) if s is not None else ""
+        try:
+            return re.sub(r"^\s*(?:[-*•–—])\s*", "", txt)
+        except re.error:
+            return txt
 
-    resumo = pick(ai_summary, ["resumo_problema", "resumo", "resumo_do_problema", "resumoProblema"]) or ""
-    solucao = pick(ai_summary, ["sugestao_solucao", "sugestao", "sugestao_de_solucao", "sugestaoDeSolucao", "solucao_sugerida"]) or ""
+    parts: list[str] = []
+    parts.append("<b>Resumo do Problema:</b><br>" + esc(resumo_text).replace("\n", "<br>"))
+    parts.append("<br><br><b>Sugestão:</b><br>" + esc(solucao_text).replace("\n", "<br>"))
 
-    resumo_html = render_block(resumo)
-    solucao_html = render_block(solucao)
+    # Ordered list (steps)
+    if isinstance(ol_items, list) and ol_items:
+        cleaned = [_clean_ol_item(item) for item in ol_items]
+        parts.append("<ol>" + "".join(f"<li>{esc(item)}</li>" for item in cleaned) + "</ol>")
 
-    return (
-        f"<b>Resumo do Problema:</b><br>{resumo_html}<br><br>"
-        f"<b>Sugestão:</b><br>{solucao_html}"
-    )
+    # Unordered list
+    if isinstance(ul_items, list) and ul_items:
+        cleaned = [_clean_ul_item(item) for item in ul_items]
+        parts.append("<ul>" + "".join(f"<li>{esc(item)}</li>" for item in cleaned) + "</ul>")
+
+    return "".join(parts)
 
 
 def build_teams_text_message(ticket: Ticket) -> str:
