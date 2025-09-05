@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import re
+import html
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 from textwrap import shorten
@@ -127,8 +128,9 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
 
     system_text = (
         "Você é um Analista de Suporte N2 dos clientes da Infraestrutura da Infiniit (infiniit.com.br). "
-        "Leia atentamente os dados do ticket e responda SOMENTE com um objeto JSON contendo EXACTAMENTE "
-        "as chaves: 'resumo_problema' e 'sugestao_solucao' (ambas strings). "
+        "Leia atentamente os dados do ticket e responda SOMENTE com um objeto JSON contendo: "
+        "'resumo_problema' (string) e 'sugestao_solucao' (string). Quando a sugestão contiver itens em lista/etapas, também preencha "
+        "'sugestao_solucao_lista' (array de strings para lista não ordenada) e/ou 'sugestao_solucao_lista_ordenada' (array de strings para passos numerados). "
         "Regras e escopo: "
         "1) Foque em análise de infraestrutura (redes, Windows/Linux Server, virtualização/VMware, backup/Veeam, firewalls, Azure/M365, monitoramento e segurança). "
         "2) Forneça diagnóstico e próxima ação acionável em nível N2: hipóteses, comandos/verificações, logs a coletar, e validações passo a passo. "
@@ -153,29 +155,67 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
 
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": OPENAI_MODEL,
-        #"reasoning":{"effort": "high"},
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": user_content},
-        ],
-        # Ensure we have some room for JSON output
-        "max_tokens": 1000,
-    }
-    try:
+
+    def _openai_debug() -> bool:
+        v = os.getenv("OPENAI_DEBUG", "").strip().lower()
+        return v in {"1", "true", "yes", "on"}
+
+    def make_payload(response_format: Dict[str, Any], content: Any) -> Dict[str, Any]:
+        return {
+            "model": OPENAI_MODEL,
+            "response_format": response_format,
+            "messages": [
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": content},
+            ],
+            "temperature": 0,
+            # Ensure we have some room for JSON output
+            "max_tokens": 1000,
+        }
+
+    def parse_response(resp_json: Dict[str, Any]) -> Dict[str, Any]:
+        content = resp_json.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        return json.loads(content)
+
+    response_format_object = {"type": "json_object"}
+
+    def post_and_parse(payload: Dict[str, Any]) -> Dict[str, Any]:
         r = requests.post(url, headers=headers, json=payload, timeout=120)
+        if r.status_code >= 400 and _openai_debug():
+            try:
+                logging.error(f"OpenAI error body: {r.text}")
+            except Exception:
+                pass
         r.raise_for_status()
-        data = r.json()
-        response_content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-        ai_summary = json.loads(response_content)
-        logging.info(f"AI response for ticket {ticket.id}: {ai_summary}")
+        return parse_response(r.json())
+
+    try:
+        # Attempt: json_object with user_content (may include images)
+        payload = make_payload(response_format_object, user_content)
+        ai_summary = post_and_parse(payload)
+        if _openai_debug():
+            logging.debug(f"AI response for ticket {ticket.id}: {ai_summary}")
         return ai_summary
-    except requests.RequestException as e:
+    except requests.HTTPError as e1:
+        # If images not supported or content must be string, retry as text-only
+        err_txt = getattr(getattr(e1, 'response', None), 'text', '') or str(e1)
+        if _openai_debug():
+            logging.debug(f"OpenAI HTTPError on first attempt: {err_txt}")
+
+        text_only = user_text
+        if image_urls:
+            text_only += "\n\nImagens (URLs):\n" + "\n".join(image_urls)
+
+        try:
+            payload2 = make_payload(response_format_object, text_only)
+            ai_summary = post_and_parse(payload2)
+            if _openai_debug():
+                logging.debug(f"AI response (json_object, text-only) for ticket {ticket.id}: {ai_summary}")
+            return ai_summary
+        except Exception as e2:
+            logging.error(f"Error calling OpenAI API after fallback: {e2}")
+    except Exception as e:
         logging.error(f"Error calling OpenAI API: {e}")
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logging.error(f"Failed to parse OpenAI response: {e}")
     return {"resumo_problema": "Error: Could not process AI response.", "sugestao_solucao": "N/A"}
 
 
@@ -289,8 +329,34 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
         # Trim content to keep the card tidy
         content_snippet = shorten(ticket.content.strip(), width=500, placeholder="…")
 
-    resumo = ai_summary.get("resumo_problema") or "N/A"
-    sugestao = ai_summary.get("sugestao_solucao") or "N/A"
+    # Be resilient to slight key variations from the model
+    def _get_first(d: Dict[str, Any], keys: list[str], default: str = "N/A") -> str:
+        for k in keys:
+            if k in d and d[k]:
+                v = d[k]
+                # Normalize non-string payloads
+                if isinstance(v, list):
+                    if all(isinstance(x, str) for x in v):
+                        return "\n".join(f"- {x}" for x in v)
+                    return json.dumps(v, ensure_ascii=False)
+                if isinstance(v, dict):
+                    return json.dumps(v, ensure_ascii=False)
+                return str(v)
+        return default
+
+    resumo = _get_first(ai_summary, [
+        "resumo_problema",
+        "resumo",
+        "resumo_do_problema",
+        "resumoProblema",
+    ])
+    sugestao = _get_first(ai_summary, [
+        "sugestao_solucao",
+        "sugestao",
+        "sugestao_de_solucao",
+        "sugestaoDeSolucao",
+        "solucao_sugerida",
+    ])
 
     # Build actions
     actions = []
@@ -309,16 +375,16 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
         "msteams": {"width": "Full"},
         "body": [
             {"type": "TextBlock", "text": "🚨 Novo Chamado! 🚨", "wrap": True, "weight": "Bolder", "size": "Large"},
-            {"type": "TextBlock", "text": f"Contato: {ticket.contact or '(não informado)'}", "wrap": True, "spacing": "Small"},
+            {"type": "TextBlock", "text": f"**Contato**: {ticket.contact or '(não informado)'}", "wrap": True, "spacing": "Small"},
         ],
         "actions": actions,
     }
 
     # Empresa (se houver)
-    if getattr(ticket, "customer", None):
+    if getattr(ticket, "customer", None):#TODO: make only the ""Empresa"" part bold
         card["body"].append({
             "type": "TextBlock",
-            "text": f"Empresa: {ticket.customer}",
+            "text": f"**Empresa**: {ticket.customer}",
             "wrap": True,
             "weight": "Bolder",
         })
@@ -326,18 +392,18 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
     # Ticket line
     card["body"].append({
         "type": "TextBlock",
-        "text": f"Ticket: #{ticket.id}: {ticket.title or '(Sem título)'}",
+        "text": f"**Ticket**: #{ticket.id}: {ticket.title or '(Sem título)'}",
         "wrap": True,
         "weight": "Bolder",
     })
 
     # Link section (now encourages using the button instead of inline link)
-    card["body"].append({
-        "type": "TextBlock",
-        "text": "\n👇 Clique no botão abaixo para abrir o chamado:",
-        "wrap": True,
-        "spacing": "Medium",
-    })
+    # card["body"].append({
+    #     "type": "TextBlock",
+    #     "text": "\n👇 Clique no botão abaixo para abrir o chamado:",
+    #     "wrap": True,
+    #     "spacing": "Medium",
+    # })
     if not ticket_url:
         card["body"].append({
             "type": "TextBlock",
@@ -346,13 +412,13 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
         })
 
     # Mention-esque line (note: incoming webhooks don't create real mentions)
-    card["body"].append({
-        "type": "TextBlock",
-        "text": "\n@Time de Suporte, alguém pode assumir?",
-        "wrap": True,
-        "weight": "Bolder",
-        "spacing": "Medium",
-    })
+    # card["body"].append({
+    #     "type": "TextBlock",
+    #     "text": "\n@Time de Suporte, alguém pode assumir?",
+    #     "wrap": True,
+    #     "weight": "Bolder",
+    #     "spacing": "Medium",
+    # })
 
     # Keep AI details at the end as an optional section
     # if content_snippet:
@@ -369,13 +435,65 @@ def build_ticket_adaptive_card(ticket: Ticket, ai_summary: Dict[str, Any]) -> Di
     return card
 
 
-def build_ai_comment_html(ai_summary: Dict[str, str]) -> str:
-    resumo = ai_summary.get('resumo_problema', 'N/A')
-    solucao = ai_summary.get('sugestao_solucao', 'N/A')
-    return (
-        f"<b>Resumo do Problema (IA):</b><br>{resumo}<br><br>"
-        f"<b>Sugestão de Solução (IA):</b><br>{solucao}"
-    )
+def build_ai_comment_html(ai_summary: Dict[str, Any]) -> str:
+    """Build Agidesk comment HTML from structured AI response.
+
+    Uses the AI's structured fields for lists when present, avoiding heuristic
+    parsing. Supports optional arrays:
+    - 'sugestao_solucao_lista' (unordered)
+    - 'sugestao_solucao_lista_ordenada' (ordered)
+    and the main strings:
+    - 'resumo_problema'
+    - 'sugestao_solucao'
+    """
+
+    def esc(s: Any) -> str:
+        return html.escape(str(s)) if s is not None else ""
+
+    resumo_text = ""
+    for k in ("resumo_problema", "resumo", "resumo_do_problema", "resumoProblema"):
+        if ai_summary.get(k):
+            resumo_text = str(ai_summary[k])
+            break
+
+    solucao_text = ""
+    for k in ("sugestao_solucao", "sugestao", "sugestao_de_solucao", "sugestaoDeSolucao", "solucao_sugerida"):
+        if ai_summary.get(k):
+            solucao_text = str(ai_summary[k])
+            break
+
+    ul_items = ai_summary.get("sugestao_solucao_lista")
+    ol_items = ai_summary.get("sugestao_solucao_lista_ordenada")
+
+    def _clean_ol_item(s: Any) -> str:
+        txt = str(s) if s is not None else ""
+        try:
+            return re.sub(r"^\s*\d+[\.)]?\s*", "", txt)
+        except re.error:
+            return txt
+
+    def _clean_ul_item(s: Any) -> str:
+        txt = str(s) if s is not None else ""
+        try:
+            return re.sub(r"^\s*(?:[-*•–—])\s*", "", txt)
+        except re.error:
+            return txt
+
+    parts: list[str] = []
+    parts.append("<b>Resumo do Problema:</b><br>" + esc(resumo_text).replace("\n", "<br>"))
+    parts.append("<br><br><b>Sugestão:</b><br>" + esc(solucao_text).replace("\n", "<br>"))
+
+    # Ordered list (steps)
+    if isinstance(ol_items, list) and ol_items:
+        cleaned = [_clean_ol_item(item) for item in ol_items]
+        parts.append("<ol>" + "".join(f"<li>{esc(item)}</li>" for item in cleaned) + "</ol>")
+
+    # Unordered list
+    if isinstance(ul_items, list) and ul_items:
+        cleaned = [_clean_ul_item(item) for item in ul_items]
+        parts.append("<ul>" + "".join(f"<li>{esc(item)}</li>" for item in cleaned) + "</ul>")
+
+    return "".join(parts)
 
 
 def build_teams_text_message(ticket: Ticket) -> str:
@@ -474,9 +592,15 @@ def main(timer: func.TimerRequest) -> None:
             initialdate=ds_time(now_utc() - timedelta(minutes=5)),
             finaldate=ds_time(now_utc()),
             per_page=100,
-            fields='id,title,content,htmlcontent,created_at,lists,customer,contact',
+            fields='id,title,content,htmlcontent,created_at,lists,customer,customers,contact,contacts,fullcustomer,fullcontact',
         )
         logging.info(f"Found {len(issues)} tickets.")
+        if MODE == "development":
+            try:
+                issues_json = [issue.model_dump(exclude_none=True) for issue in issues]
+                logging.info("Search tickets result (JSON): " + json.dumps(issues_json, ensure_ascii=False))
+            except Exception as e:
+                logging.warning(f"Failed to serialize issues to JSON for logging: {e}")
 
         new_tickets = [issue for issue in issues if str(issue.id) not in processed_ids]
         logging.info(f"Found {len(new_tickets)} new tickets to process.")

@@ -70,10 +70,16 @@ Saída esperada (exemplo simplificado por ticket):
   "title": "Problema no acesso",
   "ai_summary": {
     "resumo_problema": "...",
-    "sugestao_solucao": "..."
+    "sugestao_solucao": "...",
+    "sugestao_solucao_lista": ["opcional: itens em lista"],
+    "sugestao_solucao_lista_ordenada": ["opcional: passos numerados"]
   }
 }
 ```
+
+Observação: quando a sugestão contiver listas/etapas, o modelo retorna também os arrays opcionais
+`sugestao_solucao_lista` (não ordenada) e/ou `sugestao_solucao_lista_ordenada` (ordenada). O comentário
+enviado ao Agidesk usa diretamente esses campos estruturados para renderizar as listas corretamente.
 
 Observações do modo de teste
 - Ignora janelas/períodos de busca; usa `get_issue` por ID.

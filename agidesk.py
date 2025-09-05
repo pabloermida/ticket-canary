@@ -6,7 +6,7 @@ import json
 import time
 from datetime import datetime
 from typing import List, Optional, Dict, Union, Any
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 class Board(BaseModel):
@@ -47,6 +47,65 @@ class Ticket(BaseModel):
     lists: Optional[Dict[str, TicketList]] = None
     customer: Optional[str] = None
     contact: Optional[str] = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def derive_customer_contact(cls, data):
+        """Coerce various Agidesk shapes into simple 'customer' and 'contact' strings.
+
+        - Some payloads expose 'customers'/'contacts' as dicts keyed by ID. Pick the
+          default item when flagged, otherwise the first one, and extract a readable title.
+        - Also accept 'fullcustomer'/'fullcontact' fallbacks when present.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        def pick_name(container):
+            if container is None:
+                return None
+            items = None
+            if isinstance(container, dict):
+                items = list(container.values())
+            elif isinstance(container, list):
+                items = container
+            else:
+                return None
+            if not items:
+                return None
+            chosen = None
+            for it in items:
+                if isinstance(it, dict) and (it.get('default') == '1' or it.get('default') is True):
+                    chosen = it
+                    break
+            if chosen is None:
+                chosen = items[0] if isinstance(items[0], dict) else None
+            if not isinstance(chosen, dict):
+                return None
+            for key in ('fulltitle', 'title', 'fullname', 'contacttitle', 'fullcustomer', 'fullcontact'):
+                val = chosen.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val
+            fn = chosen.get('firstname')
+            ln = chosen.get('lastname')
+            if fn or ln:
+                return ' '.join([p for p in (fn, ln) if p])
+            return None
+
+        if 'customer' not in data or not data.get('customer'):
+            name = pick_name(data.get('customers'))
+            if name:
+                data['customer'] = name
+            elif isinstance(data.get('fullcustomer'), str):
+                data['customer'] = data['fullcustomer']
+
+        if 'contact' not in data or not data.get('contact'):
+            name = pick_name(data.get('contacts'))
+            if name:
+                data['contact'] = name
+            elif isinstance(data.get('fullcontact'), str):
+                data['contact'] = data['fullcontact']
+
+        return data
 
     @field_validator('lists', mode='before')
     @classmethod
