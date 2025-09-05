@@ -20,7 +20,7 @@ AGIDESK_ACCOUNT_ID = os.getenv("AGIDESK_ACCOUNT_ID", "")
 AGIDESK_APP_KEY = os.getenv("AGIDESK_APP_KEY", "")
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 FETCH_TIME_SECONDS = int(os.getenv("FETCH_TIME_SECONDS", "300"))
 MODE = os.getenv("MODE", "development")
 ID_BOARD_SERVICOS = "9"
@@ -106,24 +106,22 @@ def within_last_seconds(created_at: str, seconds: int = 300) -> bool:
 
 
 def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
-    """Call OpenAI to summarize the ticket. Includes images if present.
+    """Call OpenAI (Responses API) to summarize a ticket with optional image context.
 
-    If the ticket contains HTML content with <img src="..."> tags, extract the
-    image URLs and pass them to the model alongside the text using multi-part
-    message content. Falls back to text-only if no images are found.
+    - Model from `OPENAI_MODEL` (default: gpt-5)
+    - text.format = json_schema to get a structured JSON payload
+    - HTTPS images are attached as `input_image`; non-HTTPS URLs are listed inline in text
     """
 
     def extract_image_urls(html_content: Optional[str]) -> List[str]:
         if not html_content:
             return []
-        # Match src="..." or src='...' within <img ...> tags
         urls: List[str] = []
         try:
             urls.extend(re.findall(r"<img[^>]+src=\"([^\"]+)\"", html_content, flags=re.IGNORECASE))
             urls.extend(re.findall(r"<img[^>]+src='([^']+)'", html_content, flags=re.IGNORECASE))
         except re.error:
             pass
-        # Keep http(s) only to avoid data URIs or unsupported schemes
         return [u for u in urls if u.startswith("http://") or u.startswith("https://")]
 
     system_text = (
@@ -131,154 +129,99 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
         "Leia atentamente os dados do ticket e responda SOMENTE com um objeto JSON contendo: "
         "'resumo_problema' (string) e 'sugestao_solucao' (string). Quando a sugestão contiver itens em lista/etapas, também preencha "
         "'sugestao_solucao_lista' (array de strings para lista não ordenada) e/ou 'sugestao_solucao_lista_ordenada' (array de strings para passos numerados). "
-        "Regras e escopo: "
-        "1) Foque em análise de infraestrutura (redes, Windows/Linux Server, virtualização/VMware, backup/Veeam, firewalls, Azure/M365, monitoramento e segurança). "
-        "2) Forneça diagnóstico e próxima ação acionável em nível N2: hipóteses, comandos/verificações, logs a coletar, e validações passo a passo. "
-        "3) Quando pertinente, faça referência a recursos públicos abertos (nome do recurso e URL de documentação oficial, KBs de fornecedor, CVEs, guias). NÃO invente fontes; se não puder confirmar um link específico, cite apenas o nome do recurso e marque como sugestivo. "
-        "4) Se houver imagens, considere-as como evidência auxiliar. "
-        "5) Não exponha dados sensíveis além do que foi fornecido; mantenha linguagem objetiva e profissional em PT-BR. "
-        "6) Se o conteúdo for incompatível com análise de infraestrutura (ex.: assunto comercial, financeiro, sem dados técnicos, ou não relacionado a TI), retorne 'resumo_problema' como string vazia e 'sugestao_solucao' com a frase: 'Entrada incompatível com análise de infraestrutura.'. "
-        "7) Saída estritamente em JSON válido, sem texto extra, sem comentários, sem campos adicionais."
+        "Regras e escopo: 1) Infraestrutura (redes, Windows/Linux Server, VMware, backup/Veeam, firewalls, Azure/M365, monitoramento, segurança). "
+        "2) Próximas ações N2 (hipóteses, comandos/verificações, logs, validações). "
+        "3) Cite recursos públicos quando pertinente (nome e link); não invente fontes. "
+        "4) Considere imagens como evidência auxiliar. 5) Linguagem objetiva em PT-BR. "
+        "6) Se a entrada for incompatível com análise de infraestrutura, retorne 'resumo_problema' vazio e 'sugestao_solucao' = 'Entrada incompatível com análise de infraestrutura.'. "
+        "7) Saída estritamente em JSON válido, sem texto extra."
     )
+
     user_text = f"Título: {ticket.title}\nConteúdo: {ticket.content}"
-    image_urls = extract_image_urls(getattr(ticket, "htmlcontent", None))
+    raw_image_urls = extract_image_urls(getattr(ticket, "htmlcontent", None))
+    https_images: List[str] = [u for u in raw_image_urls if u.startswith("https://")]
+    non_https_images: List[str] = [u for u in raw_image_urls if not u.startswith("https://")]
+    if non_https_images:
+        user_text += "\n\nImagens (URLs):\n" + "\n".join(non_https_images)
 
-    # Build multi-part user content if images are available (Responses API types)
-    user_content: Any
-    if image_urls:
-        parts: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
-        for url in image_urls:
-            parts.append({"type": "input_image", "image_url": {"url": url}})
-        user_content = parts
-    else:
-        user_content = user_text
+    parts: List[Dict[str, Any]] = [{"type": "input_text", "text": user_text}]
+    for url in https_images:
+        parts.append({"type": "input_image", "image_url": url})
 
-    # Responses API endpoint
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-    def _openai_debug() -> bool:
-        v = os.getenv("OPENAI_DEBUG", "").strip().lower()
-        return v in {"1", "true", "yes", "on"}
+    try:
+        token_limit = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1200"))
+    except Exception:
+        token_limit = 1200
 
-    # Default token parameter for Responses API
-    token_param_name = "max_output_tokens"
-
-    def make_payload(response_format: Dict[str, Any], content: Any) -> Dict[str, Any]:
-        # Build Responses API input
-        if isinstance(content, list):
-            user_parts = content
-        else:
-            user_parts = [{"type": "text", "text": str(content)}]
-        input_payload = [
-            {"role": "system", "content": [{"type": "text", "text": system_text}]},
-            {"role": "user", "content": user_parts},
-        ]
-        payload: Dict[str, Any] = {
-            "model": OPENAI_MODEL,
-            "response_format": response_format,
-            "input": input_payload,
-            "temperature": 0,
+    text_spec_json_schema = {
+        "format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "TicketInfraSummary",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "resumo_problema": {"type": "string"},
+                        "sugestao_solucao": {"type": "string"},
+                        "sugestao_solucao_lista": {"type": "array", "items": {"type": "string"}},
+                        "sugestao_solucao_lista_ordenada": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["resumo_problema", "sugestao_solucao"],
+                },
+            },
         }
-        payload[token_param_name] = 1000
-        return payload
-
-    def parse_response(resp_json: Dict[str, Any]) -> Dict[str, Any]:
-        # 1) Shortcut present in some SDKs
-        if isinstance(resp_json, dict) and isinstance(resp_json.get("output_text"), str):
-            try:
-                return json.loads(resp_json["output_text"])  # type: ignore[index]
-            except Exception:
-                pass
-        # 2) General Responses API structure: output -> message -> content -> text
-        out = resp_json.get("output")
-        if isinstance(out, list):
-            for item in out:
-                if not isinstance(item, dict):
-                    continue
-                content = item.get("content")
-                if isinstance(content, list):
-                    for part in content:
-                        if not isinstance(part, dict):
-                            continue
-                        if part.get("type") in ("output_text", "text") and isinstance(part.get("text"), str):
-                            try:
-                                return json.loads(part.get("text", "{}"))
-                            except Exception:
-                                continue
-        # 3) Fallback to chat-completions shape if present
-        try:
-            content = resp_json.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-            return json.loads(content)
-        except Exception:
-            return {"resumo_problema": "Error: Could not parse AI response.", "sugestao_solucao": "N/A"}
-
-    response_format_object = {"type": "json_object"}
+    }
 
     def post_and_parse(payload: Dict[str, Any]) -> Dict[str, Any]:
         r = requests.post(url, headers=headers, json=payload, timeout=120)
-        if r.status_code >= 400 and _openai_debug():
-            try:
-                logging.error(f"OpenAI error body: {r.text}")
-            except Exception:
-                pass
         r.raise_for_status()
-        return parse_response(r.json())
+        data = r.json()
+        out = data.get("output")
+        if isinstance(out, list):
+            for item in out:
+                if isinstance(item, dict) and item.get("type") == "message":
+                    content = item.get("content")
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                                txt = part.get("text", "{}")
+                                try:
+                                    return json.loads(txt)
+                                except Exception:
+                                    return {"resumo_problema": "Error: Could not parse AI JSON.", "sugestao_solucao": "N/A"}
+        if isinstance(data.get("output_text"), str):
+            try:
+                return json.loads(data["output_text"])  # type: ignore[index]
+            except Exception:
+                return {"resumo_problema": "Error: Could not parse AI JSON.", "sugestao_solucao": "N/A"}
+        return {"resumo_problema": "Error: No AI content.", "sugestao_solucao": "N/A"}
 
-    def try_with_auto_token_param(content: Any) -> Optional[Dict[str, Any]]:
-        nonlocal token_param_name
-        # First try with current token_param_name
-        try:
-            payload = make_payload(response_format_object, content)
-            return post_and_parse(payload)
-        except requests.HTTPError as e:
-            body = getattr(getattr(e, 'response', None), 'text', '') or str(e)
-            if _openai_debug():
-                logging.debug(f"OpenAI HTTPError: {body}")
-            # Adjust token param if model hints
-            if "max_tokens" in body and token_param_name != "max_tokens":
-                token_param_name = "max_tokens"
-                try:
-                    payload2 = make_payload(response_format_object, content)
-                    return post_and_parse(payload2)
-                except Exception:
-                    pass
-            if "max_completion_tokens" in body and token_param_name != "max_completion_tokens":
-                token_param_name = "max_completion_tokens"
-                try:
-                    payload3 = make_payload(response_format_object, content)
-                    return post_and_parse(payload3)
-                except Exception:
-                    pass
-            raise
-
+    # Primary attempt
+    payload = {
+        "model": OPENAI_MODEL,
+        "text": text_spec_json_schema,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
+            {"role": "user", "content": parts},
+        ],
+        "max_output_tokens": token_limit,
+    }
     try:
-        # Attempt: json_object with user_content (may include images)
-        ai_summary = try_with_auto_token_param(user_content)
-        if ai_summary is not None:
-            if _openai_debug():
-                logging.debug(f"AI response for ticket {ticket.id}: {ai_summary}")
-            return ai_summary
-    except requests.HTTPError as e1:
-        # If images not supported or content must be string, retry as text-only
-        err_txt = getattr(getattr(e1, 'response', None), 'text', '') or str(e1)
-        if _openai_debug():
-            logging.debug(f"OpenAI HTTPError on first attempt: {err_txt}")
-
-        text_only = user_text
-        if image_urls:
-            text_only += "\n\nImagens (URLs):\n" + "\n".join(image_urls)
-
-        try:
-            ai_summary = try_with_auto_token_param(text_only)
-            if ai_summary is not None:
-                if _openai_debug():
-                    logging.debug(f"AI response (json_object, text-only) for ticket {ticket.id}: {ai_summary}")
-                return ai_summary
-        except Exception as e2:
-            logging.error(f"Error calling OpenAI API after fallback: {e2}")
-    except Exception as e:
-        logging.error(f"Error calling OpenAI API: {e}")
+        return post_and_parse(payload)
+    except requests.HTTPError as e:
+        body = getattr(getattr(e, 'response', None), 'text', '') or str(e)
+        if "max_completion_tokens" in body:
+            payload2 = dict(payload)
+            payload2.pop("max_output_tokens", None)
+            payload2["max_completion_tokens"] = token_limit
+            return post_and_parse(payload2)
+    except Exception:
+        pass
     return {"resumo_problema": "Error: Could not process AI response.", "sugestao_solucao": "N/A"}
 
 

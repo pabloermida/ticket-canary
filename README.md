@@ -20,9 +20,9 @@ export AGIDESK_APP_KEY="SEU_TOKEN"              # API Key do Agidesk
 export TEAMS_WEBHOOK_URL="https://...incomingwebhook..."  # Webhook do Teams
 
 # OpenAI (usado para resumo/sugestão no card do Teams)
-# Agora usando a Responses API (\`/v1/responses\`) com \`response_format: json_object\`.
+# Agora usando a Responses API (\`/v1/responses\`) com \`text.format: {type: json_object}\` para saída estruturada.
 export OPENAI_API_KEY="sk-..."
-export OPENAI_MODEL="gpt-4.1-mini"
+export OPENAI_MODEL="gpt-5-nano"
 
 # Modo de execução: development = leitura + Teams; production = também escreve comentário no Agidesk
 export MODE="development"
@@ -43,7 +43,17 @@ export AGIDESK_TICKET_URL_TEMPLATE="https://cliente.infiniit.com.br/br/painel/at
 # Define estilo do Teams: "card" (padrão) ou "text"
 export LOCAL_TEST_SEND_TEAMS=0
 export TEAMS_MESSAGE_STYLE="card"
+export OPENAI_ENABLE_WEB_SEARCH=0   # opcional: ferramenta de pesquisa web (somente com text.format = {type: text})
+export OPENAI_TEXT_DEBUG=0          # opcional: força saída em texto simples para debug
+
+Notas sobre Web Search e Debug
+- O recurso de pesquisa web da Responses API não é compatível com modo JSON (text.format = {type: json_object/json_schema}).
+- Para usar Web Search, defina o formato como texto (text.format = {type: text}) ou desative a exigência de JSON no código.
+- Neste projeto, quando OPENAI_ENABLE_WEB_SEARCH=1 estiver ativo, a ferramenta só será ligada quando o formato for texto; em JSON, ela permanece desativada para evitar erros.
+- Para depuração rápida, defina OPENAI_TEXT_DEBUG=1 para forçar formato texto e mapear a resposta crua para `resumo_problema` (e `sugestao_solucao` vazio). Útil quando o JSON do modelo vem inválido ou vazio.
 ```
+# (Opcional) Limite de tokens de saída (Responses API)
+export OPENAI_MAX_OUTPUT_TOKENS=1200
 
 3) Rodar localmente (modo de teste por IDs)
 
