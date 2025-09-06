@@ -127,8 +127,8 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
     system_text = (
         "Você é um Analista de Suporte N2 dos clientes da Infraestrutura da Infiniit (infiniit.com.br). "
         "Leia atentamente os dados do ticket e responda SOMENTE com um objeto JSON contendo: "
-        "'resumo_problema' (string) e 'sugestao_solucao' (string). Quando a sugestão contiver itens em lista/etapas, também preencha "
-        "'sugestao_solucao_lista' (array de strings para lista não ordenada) e/ou 'sugestao_solucao_lista_ordenada' (array de strings para passos numerados). "
+        "'resumo_problema' (string), 'sugestao_solucao' (string) e 'sugestao_solucao_lista' (array de strings). "
+        "Sempre inclua o array; quando não houver itens, retorne []. Priorize uma lista prática, com 8–15 itens claros e acionáveis. "
         "Regras e escopo: 1) Infraestrutura (redes, Windows/Linux Server, VMware, backup/Veeam, firewalls, Azure/M365, monitoramento, segurança). "
         "2) Próximas ações N2 (hipóteses, comandos/verificações, logs, validações). "
         "3) Cite recursos públicos quando pertinente (nome e link); não invente fontes. "
@@ -151,6 +151,9 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
+    def _dbg_enabled() -> bool:
+        return os.getenv("OPENAI_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
     try:
         token_limit = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1200"))
     except Exception:
@@ -159,26 +162,78 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
     text_spec_json_schema = {
         "format": {
             "type": "json_schema",
-            "json_schema": {
-                "name": "TicketInfraSummary",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "resumo_problema": {"type": "string"},
-                        "sugestao_solucao": {"type": "string"},
-                        "sugestao_solucao_lista": {"type": "array", "items": {"type": "string"}},
-                        "sugestao_solucao_lista_ordenada": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["resumo_problema", "sugestao_solucao"],
+            "name": "TicketInfraSummary",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "resumo_problema": {"type": "string"},
+                    "sugestao_solucao": {"type": "string"},
+                    "sugestao_solucao_lista": {"type": "array", "minItems": 5, "items": {"type": "string"}},
                 },
+                "required": [
+                    "resumo_problema",
+                    "sugestao_solucao",
+                    "sugestao_solucao_lista"
+                ],
             },
         }
     }
 
+    def _safe_excerpt(obj: Any, n: int = 4000) -> str:
+        try:
+            return json.dumps(obj, ensure_ascii=False)[:n]
+        except Exception:
+            try:
+                return str(obj)[:n]
+            except Exception:
+                return ""
+
+    def _extract_structured_from_text(txt: str) -> Optional[Dict[str, Any]]:
+        # Try strict JSON first
+        try:
+            parsed = json.loads(txt)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        # Heuristic extraction: pull known fields with regex
+        try:
+            rp = None
+            ss = None
+            lst = None
+            lst_ord = None
+            m = re.search(r'"resumo_problema"\s*:\s*"(.*?)"', txt, re.DOTALL)
+            if m:
+                rp = m.group(1).strip()
+            m = re.search(r'"sugestao_solucao"\s*:\s*"(.*?)"', txt, re.DOTALL)
+            if m:
+                ss = m.group(1).strip()
+            m = re.search(r'"sugestao_solucao_lista"\s*:\s*\[(.*?)\]', txt, re.DOTALL)
+            if m:
+                arr_text = '[' + m.group(1) + ']'
+                try:
+                    lst = json.loads(arr_text)
+                except Exception:
+                    lst = None
+            if any(v is not None for v in (rp, ss, lst)):
+                return {
+                    "resumo_problema": rp or "",
+                    "sugestao_solucao": ss or "",
+                    "sugestao_solucao_lista": lst or [],
+                }
+        except Exception:
+            pass
+        return None
+
     def post_and_parse(payload: Dict[str, Any]) -> Dict[str, Any]:
         r = requests.post(url, headers=headers, json=payload, timeout=120)
+        if _dbg_enabled() and r.status_code >= 400:
+            try:
+                logging.error(f"OpenAI error body: {r.text}")
+            except Exception:
+                pass
         r.raise_for_status()
         data = r.json()
         out = data.get("output")
@@ -201,6 +256,74 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
                 return {"resumo_problema": "Error: Could not parse AI JSON.", "sugestao_solucao": "N/A"}
         return {"resumo_problema": "Error: No AI content.", "sugestao_solucao": "N/A"}
 
+    def _extract_bullets_from_text(txt: str, max_items: int = 20) -> list[str]:
+        items: list[str] = []
+        try:
+            for raw in txt.splitlines():
+                line = raw.strip()
+                m = re.match(r"^(?:[-*•–—]\s+|\d+[\.)]\s+)(.+)$", line)
+                if m:
+                    val = m.group(1).strip()
+                    if val and val not in items:
+                        items.append(val)
+                        if len(items) >= max_items:
+                            break
+        except Exception:
+            pass
+        return items
+
+    def post_and_text(payload: Dict[str, Any]) -> Dict[str, Any]:
+        r = requests.post(url, headers=headers, json=payload, timeout=120)
+        if _dbg_enabled() and r.status_code >= 400:
+            try:
+                logging.error(f"OpenAI error body: {r.text}")
+            except Exception:
+                pass
+        r.raise_for_status()
+        data = r.json()
+        # Try Responses shapes for raw text
+        out = data.get("output")
+        if isinstance(out, list):
+            for item in out:
+                if isinstance(item, dict) and item.get("type") == "message":
+                    content = item.get("content")
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                                txt = str(part.get("text") or "").strip()
+                                # Try to parse JSON if the model still produced it
+                                structured = _extract_structured_from_text(txt)
+                                if isinstance(structured, dict):
+                                    return {
+                                        **structured,
+                                        "sugestao_solucao_lista": structured.get("sugestao_solucao_lista") or [],
+                                    }
+                                bullets = _extract_bullets_from_text(txt)
+                                return {"resumo_problema": txt or "", "sugestao_solucao": "", "sugestao_solucao_lista": bullets}
+        if isinstance(data.get("output_text"), str):
+            txt = data.get("output_text", "")
+            structured = _extract_structured_from_text(txt)
+            if isinstance(structured, dict):
+                return {
+                    **structured,
+                    "sugestao_solucao_lista": structured.get("sugestao_solucao_lista") or [],
+                }
+            bullets = _extract_bullets_from_text(txt)
+            return {"resumo_problema": txt or "", "sugestao_solucao": "", "sugestao_solucao_lista": bullets}
+        return {"resumo_problema": "", "sugestao_solucao": "", "sugestao_solucao_lista": []}
+
+    def _valid_structured(ai: Dict[str, Any]) -> bool:
+        try:
+            rp = str(ai.get("resumo_problema", "")).strip()
+            ss = str(ai.get("sugestao_solucao", "")).strip()
+            if not rp:
+                return False
+            if rp.startswith("Error:"):
+                return False
+            return True
+        except Exception:
+            return False
+
     # Primary attempt
     payload = {
         "model": OPENAI_MODEL,
@@ -212,14 +335,131 @@ def call_openai_simplified(ticket: Ticket) -> Dict[str, Any]:
         "max_output_tokens": token_limit,
     }
     try:
-        return post_and_parse(payload)
+        result = post_and_parse(payload)
+        if _dbg_enabled():
+            # Attach non-sensitive request/response metadata
+            meta = {
+                "path": "schema",
+                "model": OPENAI_MODEL,
+                "format": "json_schema",
+                "token_param": "max_output_tokens",
+                "token_limit": token_limit,
+                "user_text_parts": 1,
+                "user_image_parts": len(https_images),
+                "images_https": len(https_images),
+                "images_non_https": len(non_https_images),
+            }
+            result.setdefault("debug_meta", meta)
+        if _valid_structured(result):
+            return result
+        # Fallback to plain text format if structured result is empty/invalid
+        is_gpt5 = (OPENAI_MODEL or "").strip().lower().startswith("gpt-5")
+        payload_text = {
+            "model": OPENAI_MODEL,
+            "text": {"format": {"type": "text"}, "verbosity": "high"},
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
+                {"role": "user", "content": parts},
+            ],
+            "max_output_tokens": token_limit,
+            "tool_choice": "none",
+        }
+        if is_gpt5:
+            payload_text["reasoning"] = {"effort": "low"}
+        text_result = post_and_text(payload_text)
+        if _dbg_enabled():
+            meta = {
+                "path": "text_fallback",
+                "model": OPENAI_MODEL,
+                "format": "text",
+                "token_param": "max_output_tokens",
+                "token_limit": token_limit,
+                "user_text_parts": 1,
+                "user_image_parts": len(https_images),
+                "images_https": len(https_images),
+                "images_non_https": len(non_https_images),
+            }
+            text_result.setdefault("debug_meta", meta)
+        return text_result
     except requests.HTTPError as e:
         body = getattr(getattr(e, 'response', None), 'text', '') or str(e)
         if "max_completion_tokens" in body:
             payload2 = dict(payload)
             payload2.pop("max_output_tokens", None)
             payload2["max_completion_tokens"] = token_limit
-            return post_and_parse(payload2)
+            result = post_and_parse(payload2)
+            if _dbg_enabled():
+                meta = {
+                    "path": "schema_compat_token",
+                    "model": OPENAI_MODEL,
+                    "format": "json_schema",
+                    "token_param": "max_completion_tokens",
+                    "token_limit": token_limit,
+                    "user_text_parts": 1,
+                    "user_image_parts": len(https_images),
+                    "images_https": len(https_images),
+                    "images_non_https": len(non_https_images),
+                }
+                result.setdefault("debug_meta", meta)
+            if _valid_structured(result):
+                return result
+            payload_text2 = {
+                "model": OPENAI_MODEL,
+                "text": {"format": {"type": "text"}, "verbosity": "high"},
+                "input": [
+                    {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
+                    {"role": "user", "content": parts},
+                ],
+                "max_completion_tokens": token_limit,
+                "tool_choice": "none",
+            }
+            if is_gpt5:
+                payload_text2["reasoning"] = {"effort": "low"}
+            text_result2 = post_and_text(payload_text2)
+            if _dbg_enabled():
+                meta = {
+                    "path": "text_fallback_compat_token",
+                    "model": OPENAI_MODEL,
+                    "format": "text",
+                    "token_param": "max_completion_tokens",
+                    "token_limit": token_limit,
+                    "user_text_parts": 1,
+                    "user_image_parts": len(https_images),
+                    "images_https": len(https_images),
+                    "images_non_https": len(non_https_images),
+                }
+                text_result2.setdefault("debug_meta", meta)
+                text_result2["debug_response_excerpt"] = _safe_excerpt(body)
+            return text_result2
+        # Generic fallback to text on other HTTP errors
+        payload_text3 = {
+            "model": OPENAI_MODEL,
+            "text": {"format": {"type": "text"}, "verbosity": "high"},
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
+                {"role": "user", "content": parts},
+            ],
+            "max_output_tokens": token_limit,
+            "tool_choice": "none",
+        }
+        if is_gpt5:
+            payload_text3["reasoning"] = {"effort": "low"}
+        text_result3 = post_and_text(payload_text3)
+        if _dbg_enabled():
+            meta = {
+                "path": "text_fallback_http_error",
+                "model": OPENAI_MODEL,
+                "format": "text",
+                "token_param": "max_output_tokens",
+                "token_limit": token_limit,
+                "user_text_parts": 1,
+                "user_image_parts": len(https_images),
+                "images_https": len(https_images),
+                "images_non_https": len(non_https_images),
+            }
+            text_result3.setdefault("debug_meta", meta)
+            text_result3["debug_response_excerpt"] = _safe_excerpt(body)
+        return text_result3
     except Exception:
         pass
     return {"resumo_problema": "Error: Could not process AI response.", "sugestao_solucao": "N/A"}
@@ -446,8 +686,7 @@ def build_ai_comment_html(ai_summary: Dict[str, Any]) -> str:
 
     Uses the AI's structured fields for lists when present, avoiding heuristic
     parsing. Supports optional arrays:
-    - 'sugestao_solucao_lista' (unordered)
-    - 'sugestao_solucao_lista_ordenada' (ordered)
+    - 'sugestao_solucao_lista' (itens sugeridos)
     and the main strings:
     - 'resumo_problema'
     - 'sugestao_solucao'
@@ -469,14 +708,6 @@ def build_ai_comment_html(ai_summary: Dict[str, Any]) -> str:
             break
 
     ul_items = ai_summary.get("sugestao_solucao_lista")
-    ol_items = ai_summary.get("sugestao_solucao_lista_ordenada")
-
-    def _clean_ol_item(s: Any) -> str:
-        txt = str(s) if s is not None else ""
-        try:
-            return re.sub(r"^\s*\d+[\.)]?\s*", "", txt)
-        except re.error:
-            return txt
 
     def _clean_ul_item(s: Any) -> str:
         txt = str(s) if s is not None else ""
@@ -488,11 +719,6 @@ def build_ai_comment_html(ai_summary: Dict[str, Any]) -> str:
     parts: list[str] = []
     parts.append("<b>Resumo do Problema:</b><br>" + esc(resumo_text).replace("\n", "<br>"))
     parts.append("<br><br><b>Sugestão:</b><br>" + esc(solucao_text).replace("\n", "<br>"))
-
-    # Ordered list (steps)
-    if isinstance(ol_items, list) and ol_items:
-        cleaned = [_clean_ol_item(item) for item in ol_items]
-        parts.append("<ol>" + "".join(f"<li>{esc(item)}</li>" for item in cleaned) + "</ol>")
 
     # Unordered list
     if isinstance(ul_items, list) and ul_items:
